@@ -184,5 +184,5 @@ Both new backend modules exceed the required 80% line coverage.
 ## Merge evidence
 
 RED is preserved in `d9458e9`, `f445eb1`, `ec8bfb1`, and `131fcf2`. GREEN is
-captured by the commands above and by the following implementation checkpoint
-commit on this branch.
+captured by the commands above and by implementation checkpoint commits
+`4c9d6b8` and `92d4d5f` on this branch.
