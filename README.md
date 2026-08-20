@@ -17,7 +17,7 @@ and mailbox providers to complete registration without browser automation.
 - FastAPI backend with a Vue 3 and Element Plus WebUI
 - Account credential storage and configurable export formats
 - Exact `plus-1-month-free` Plus trial eligibility checks
-- Side-effect-limited GCash payment eligibility checks
+- Side-effect-limited GCash payment-method availability checks
 
 ## Requirements
 
@@ -100,7 +100,7 @@ classifications:
 The existing `POST /api/registered/check_plus` request format and legacy UI
 status fields remain supported.
 
-### GCash payment eligibility
+### GCash payment-method availability
 
 GCash uses a separate, explicit action and endpoint:
 
@@ -134,40 +134,58 @@ embed that admin token in frontend JavaScript.
 
 The probe performs only this bounded sequence:
 
-1. Create a PHP checkout for the ChatGPT Plus monthly plan.
-2. Update the same checkout with `plus-1-month-free`.
-3. Calculate checkout taxes on a best-effort basis.
-4. Resolve the checkout and collect amount, currency, and custom-method evidence.
-5. If a custom payment method ID is discovered from the live response, ask
-   Stripe Elements for its capability metadata.
+1. Create a minimal checkout for the ChatGPT Plus monthly plan. Billing
+   country and currency are inferred by ChatGPT from the selected proxy exit;
+   the request does not force `PH`/`PHP`.
+2. Resolve the checkout and collect payment-method evidence when available.
+3. Ask Stripe Payment Pages for capability metadata when the checkout returns
+   a publishable key.
+4. If a live custom-method ID and customer session secret are present, make the
+   optional Stripe Elements capability request.
 
-The probe contains no checkout-confirm, custom-payment start, or payment
-execution operation. It never submits a GCash account or authorizes a charge.
-Creating and updating a checkout is still a remote side effect, so the WebUI
-always requires an explicit confirmation before it runs.
+The availability probe does not send `promo_campaign`, call checkout update,
+calculate taxes, confirm checkout, start a custom payment method, or execute a
+payment. It never submits a GCash account or authorizes a charge. Creating a
+checkout is still a remote side effect, so the WebUI always requires explicit
+confirmation before it runs.
 
-`eligible` requires explicit evidence that:
+The decision depends only on payment-method evidence:
 
-- the custom method is GCash;
-- the checkout currency is PHP; and
-- the amount is present and non-negative (both zero and positive amounts are
-  accepted).
+- an explicit GCash method or a live opaque `cpmt_...` custom-method entry is
+  present -> `eligible` (`GCash available`);
+- an explicit method list without GCash is present -> `ineligible`
+  (`GCash unavailable`);
+- a successful checkout has no usable method list -> `ineligible` with the
+  `gcash_evidence_missing` decision, per the binary policy.
+- a rejected or incomplete checkout response -> `ineligible` with a stable
+  `checkout_*` or `gcash_evidence_incomplete` decision.
 
-The current policy is deliberately binary for checkout evidence:
+Amount and currency values are retained only as diagnostics. Zero, positive,
+negative, missing, conflicting, PHP, and non-PHP values do not change the
+GCash availability result.
 
-- GCash + PHP + amount `0` or greater -> `eligible`;
-- GCash absent, a non-PHP currency, missing fields, negative amounts, or
-  conflicting evidence -> `ineligible`.
+The WebUI deliberately exposes only two account outcomes: `GCash available` or
+`GCash unavailable`. Missing credentials, authentication failures, malformed
+responses, and transport failures are also normalized to `GCash unavailable`
+because the requested contract has no third `unknown` state. Their stable
+`decision`, `status`, and `retryable` fields remain available in the detail
+view/logs so an operator can distinguish “not present” from “could not read”.
+For a real PH GCash check, use a working Philippines proxy; a direct/US exit
+will normally return the US method set and therefore `GCash unavailable`.
+If a deployment needs to supply a known opaque custom-method ID for the
+optional Stripe Elements request, set `GCASH_CUSTOM_PAYMENT_METHOD_ID`; no ID
+is hardcoded in the application.
 
-Operational failures such as an invalid access token, transport error, or
-unusable upstream response remain `unknown` because no checkout evidence was
-successfully obtained. The custom payment method ID is discovered from live
-responses; the application does not embed an ID copied from another
-repository.
+The endpoint name and stored key remain `check_gcash` for API compatibility.
+Results saved by an older build (for example, `checkout_http_400` with the
+legacy `GCash status unknown` label) are normalized to `GCash unavailable` when
+read. Running the check again replaces the legacy record with the new
+proxy-aware result and preserves its technical decision code.
 
 ### Proxy behavior
 
-The selected proxy is used consistently for every stage of a check. A failed
+The selected proxy is used consistently for checkout and capability reads. The
+checkout country follows that egress instead of a hard-coded billing country. A failed
 proxy request does not silently fall back to a direct connection. Proxy
 credentials, access tokens, cookies, checkout session IDs, customer secrets,
 and raw upstream bodies are excluded from stored eligibility results.
@@ -232,8 +250,9 @@ called.
   credentials, SMS API keys, and export-panel keys out of Git.
 - Keep the WebUI bound to localhost unless a trusted reverse proxy provides
   authentication and TLS.
-- Treat `unknown` as inconclusive. Retrying repeatedly can trigger upstream
-  rate limits.
+- Treat a negative GCash result as unavailable under the binary policy; inspect
+  its decision/status fields before retrying repeatedly, since retries can
+  trigger upstream rate limits.
 - ChatGPT and Stripe endpoints used by the eligibility checks are not stable
   public APIs and may change without notice.
 - Review `git diff` before publishing changes and run dependency audits as part

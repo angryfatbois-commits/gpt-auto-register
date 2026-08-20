@@ -127,6 +127,10 @@ class GCashLegacyResultTests(unittest.TestCase):
         self.assertEqual(result["label"], "GCash unavailable")
         self.assertEqual(result["decision"], "checkout_transport_error")
 
+        detail = db.get_registered("legacy@example.com")["extra"]["gcash_check"]
+        self.assertEqual(detail["classification"], "ineligible")
+        self.assertEqual(detail["label"], "GCash unavailable")
+
 
 if __name__ == "__main__":
     unittest.main()

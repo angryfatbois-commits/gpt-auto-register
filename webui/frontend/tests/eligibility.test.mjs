@@ -3,6 +3,7 @@ import test from 'node:test'
 
 import {
   formatGCashDetail,
+  gcashDisplayLabel,
   gcashProbeRequestConfig,
   gcashStatusType,
   summarizeGCash,
@@ -19,22 +20,23 @@ test('GCash API calls carry the explicit side-effect acknowledgement', () => {
 })
 
 
-test('summarizeGCash reports all three classifications in English', () => {
+test('summarizeGCash collapses every non-positive result to unavailable', () => {
   const summary = summarizeGCash({
     'one@example.com': { classification: 'eligible' },
     'two@example.com': { classification: 'ineligible' },
     'three@example.com': { classification: 'unknown' },
   })
 
-  assert.deepEqual(summary.counts, { eligible: 1, ineligible: 1, unknown: 1 })
-  assert.equal(summary.text, 'Completed: 1 eligible, 1 ineligible, 1 unknown')
+  assert.deepEqual(summary.counts, { eligible: 1, ineligible: 2 })
+  assert.equal(summary.text, 'Completed: 1 available, 2 unavailable')
 })
 
-test('unknown status detail includes the last conclusive verdict', () => {
+test('failed legacy status detail is presented as unavailable', () => {
   const text = formatGCashDetail(
     {
       classification: 'unknown',
       decision: 'checkout_timeout',
+      label: 'GCash check failed',
       checked_at: 100,
       last_conclusive: {
         classification: 'eligible',
@@ -45,12 +47,35 @@ test('unknown status detail includes the last conclusive verdict', () => {
   )
 
   assert.match(text, /Decision: checkout_timeout/)
+  assert.match(text, /Method: GCash unavailable/)
   assert.match(text, /Checked: time:100/)
-  assert.match(text, /Last conclusive: eligible/)
+  assert.doesNotMatch(text, /unknown|check failed/i)
 })
 
-test('status colors distinguish eligible, ineligible, and unknown', () => {
+test('status colors are binary for available and unavailable checks', () => {
   assert.equal(gcashStatusType('eligible'), 'success')
   assert.equal(gcashStatusType('ineligible'), 'warning')
-  assert.equal(gcashStatusType('unknown'), 'info')
+  assert.equal(gcashStatusType('unknown'), 'warning')
+})
+
+test('availability detail shows the inferred checkout region when present', () => {
+  const text = formatGCashDetail(
+    {
+      classification: 'ineligible',
+      decision: 'gcash_unavailable',
+      checkout_country: 'US',
+      currency: 'USD',
+      checked_at: 100,
+    },
+    (value) => `time:${value}`,
+  )
+
+  assert.match(text, /Method: GCash unavailable/)
+  assert.match(text, /Checkout: US \/ USD/)
+})
+
+test('legacy stored labels are presented as availability labels', () => {
+  assert.equal(gcashDisplayLabel({ label: 'GCash eligible' }), 'GCash available')
+  assert.equal(gcashDisplayLabel({ label: 'GCash ineligible' }), 'GCash unavailable')
+  assert.equal(gcashDisplayLabel({ label: 'GCash status unknown' }), 'GCash unavailable')
 })

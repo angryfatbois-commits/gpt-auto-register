@@ -177,8 +177,36 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertEqual(result["decision"], "gcash_unavailable")
 
+    def test_explicit_non_gcash_custom_label_overrides_an_opaque_candidate(self):
+        result = classify_gcash_evidence([
+            {"custom_payment_methods": ["cpmt_live_discovered"]},
+            {
+                "custom_payment_method_data": [
+                    {"id": "cpmt_live_discovered", "display_name": "Other wallet"}
+                ]
+            },
+        ])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["method_available"])
+
 
 class GCashNetworkProbeTests(unittest.TestCase):
+    def test_missing_access_token_returns_unavailable_without_network(self):
+        factories = []
+
+        result = probe_gcash(
+            "",
+            session_factory=lambda **kwargs: factories.append(kwargs),
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["label"], "GCash unavailable")
+        self.assertEqual(result["decision"], "missing_access_token")
+        self.assertEqual(result["status"], "no_at")
+        self.assertEqual(factories, [])
+
     def test_rejects_checkout_session_path_injection(self):
         session = FakeSession([
             FakeResponse({
@@ -192,7 +220,8 @@ class GCashNetworkProbeTests(unittest.TestCase):
             session_factory=lambda **_: session,
         )
 
-        self.assertEqual(result["classification"], "unknown")
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["label"], "GCash unavailable")
         self.assertEqual(result["decision"], "checkout_session_invalid")
         self.assertEqual(len(session.calls), 1)
 
@@ -234,11 +263,10 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertNotIn("check_card_proxy", checkout_call[2]["json"])
         stripe_call = session.calls[-1]
         self.assertEqual(
-            stripe_call[1],
-            "https://api.stripe.com/v1/payment_pages/cs_test_dynamic_method/init",
+            stripe_call[1], "https://api.stripe.com/v1/elements/sessions",
         )
         self.assertEqual(
-            stripe_call[2]["data"]["custom_payment_methods[0]"],
+            stripe_call[2]["params"]["custom_payment_methods[0]"],
             "cpmt_dynamic_from_checkout",
         )
 
@@ -265,6 +293,99 @@ class GCashNetworkProbeTests(unittest.TestCase):
         urls = [url for _, url, _ in session.calls]
         self.assertFalse(any(url.endswith("/payments/checkout/update") for url in urls))
         self.assertFalse(any(url.endswith("/payments/checkout/taxes") for url in urls))
+
+    def test_checkout_does_not_force_ph_billing_country(self):
+        """The upstream must infer country from the selected proxy/IP."""
+        checkout = {
+            "checkout_session_id": "cs_test_inferred_country",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_inferred_country",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"payment_method_types": ["card"]}),
+            FakeResponse({"payment_method_types": ["card"]}),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            proxy="http://proxy.example:8080",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        checkout_payload = session.calls[0][2]["json"]
+        self.assertNotIn("billing_details", checkout_payload)
+        self.assertNotIn("promo_campaign", checkout_payload)
+        self.assertEqual(result["checkout_country"], "PH")
+        self.assertEqual(result["currency"], "PHP")
+        self.assertEqual(
+            session.calls[-1][2]["data"]["browser_timezone"],
+            "Asia/Manila",
+        )
+
+    def test_incomplete_capability_response_is_unavailable_not_unknown(self):
+        checkout = {
+            "checkout_session_id": "cs_test_incomplete_capability",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_incomplete_capability",
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({}, status_code=503),
+            FakeResponse({}, status_code=503),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["conclusive"])
+        self.assertEqual(result["decision"], "gcash_evidence_incomplete")
+
+    def test_resolve_auth_failure_is_not_hidden_by_later_stripe_failure(self):
+        checkout = {
+            "checkout_session_id": "cs_test_resolve_auth_failure",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_resolve_auth_failure",
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({}, status_code=401),
+            FakeResponse({}, status_code=503),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["label"], "GCash unavailable")
+        self.assertEqual(result["status"], "token_invalid")
+        self.assertEqual(result["decision"], "resolve_http_401")
+
+    def test_billing_country_mismatch_is_unavailable_not_unknown(self):
+        session = FakeSession([
+            FakeResponse(
+                {"detail": "Billing country must match request country."},
+                status_code=400,
+            )
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["conclusive"])
+        self.assertEqual(result["decision"], "checkout_billing_country_mismatch")
 
     def test_explicit_checkout_evidence_survives_resolve_failure(self):
         checkout = {
@@ -294,11 +415,9 @@ class GCashNetworkProbeTests(unittest.TestCase):
             **_gcash_payload(),
         }
         resolved = _gcash_payload()
-        stripe = _gcash_payload()
         session = FakeSession([
             FakeResponse(checkout),
             FakeResponse(resolved),
-            FakeResponse(stripe),
         ])
         factory_calls = []
 
@@ -320,10 +439,10 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["proxy"], "socks5://proxy-user:proxy-pass@example.test:1080")
         self.assertTrue(session.closed)
         urls = [url for _, url, _ in session.calls]
-        self.assertEqual(len(urls), 3)
+        self.assertEqual(len(urls), 2)
         self.assertTrue(any(url.endswith("/payments/checkout") for url in urls))
         self.assertTrue(any("/payments/checkout/openai_ie/cs_test_safe_probe" in url for url in urls))
-        self.assertTrue(any("/v1/payment_pages/cs_test_safe_probe/init" in url for url in urls))
+        self.assertFalse(any(url == "https://api.stripe.com/v1/elements/sessions" for url in urls))
         self.assertFalse(any("confirm" in url or "custom_payment_method/start" in url for url in urls))
         self.assertTrue(all(call[2]["allow_redirects"] is False for call in session.calls))
         serialized = repr(result)
@@ -333,7 +452,31 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertNotIn("cs_test_safe_probe", serialized)
         self.assertNotIn("proxy-pass", serialized)
 
-    def test_transport_error_is_unknown_and_redacted(self):
+    def test_payment_pages_init_is_used_when_no_custom_id_is_returned(self):
+        checkout = {
+            "checkout_session_id": "cs_test_standard_methods",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_standard",
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"payment_method_types": ["card"]}),
+            FakeResponse({"payment_method_types": ["card", "gcash"]}),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(session.calls[-1][0], "POST")
+        self.assertEqual(
+            session.calls[-1][1],
+            "https://api.stripe.com/v1/payment_pages/cs_test_standard_methods/init",
+        )
+
+    def test_transport_error_is_unavailable_and_redacted(self):
         class BrokenSession(FakeSession):
             def post(self, url, **kwargs):
                 raise RuntimeError(
@@ -347,7 +490,8 @@ class GCashNetworkProbeTests(unittest.TestCase):
             session_factory=lambda **_: session,
         )
 
-        self.assertEqual(result["classification"], "unknown")
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["label"], "GCash unavailable")
         self.assertEqual(result["decision"], "checkout_transport_error")
         self.assertTrue(result["retryable"])
         self.assertNotIn("password", repr(result))

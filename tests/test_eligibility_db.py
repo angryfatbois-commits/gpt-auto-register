@@ -43,12 +43,12 @@ class EligibilityPersistenceTests(unittest.TestCase):
         self.assertEqual(row["plus_check"]["classification"], "eligible")
         self.assertEqual(row["gcash_check"]["classification"], "eligible")
 
-    def test_unknown_attempt_preserves_last_conclusive_result(self):
+    def test_unknown_attempt_is_normalized_to_binary_unavailable(self):
         eligible = {
             "classification": "eligible",
             "conclusive": True,
             "eligible": True,
-            "decision": "gcash_zero_due_available",
+            "decision": "gcash_available",
         }
         unknown = {
             "classification": "unknown",
@@ -61,8 +61,10 @@ class EligibilityPersistenceTests(unittest.TestCase):
 
         check = db.list_registered()[0]["gcash_check"]
 
-        self.assertEqual(check["classification"], "unknown")
-        self.assertEqual(check["last_conclusive"]["classification"], "eligible")
+        self.assertEqual(check["classification"], "ineligible")
+        self.assertFalse(check["eligible"])
+        self.assertEqual(check["label"], "GCash unavailable")
+        self.assertEqual(check["last_conclusive"]["classification"], "ineligible")
         self.assertNotIn("sensitive-access-token", repr(check))
 
     def test_rejects_unknown_extra_json_key(self):

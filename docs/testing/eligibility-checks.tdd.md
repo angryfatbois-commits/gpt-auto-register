@@ -14,13 +14,13 @@ repository.
    eligible for the exact `plus-1-month-free` campaign so that I do not confuse
    another offer with the requested Plus trial.
 2. As an account operator, I want to explicitly probe GCash availability so
-   that I can distinguish `eligible`, `ineligible`, and inconclusive accounts.
+   that every account has one of two clear outcomes: available or unavailable.
 3. As a security-conscious operator, I want the GCash probe to stop before
-   checkout confirmation or payment start so that an eligibility check cannot
+   checkout confirmation or payment start so that an availability check cannot
    execute a payment.
-4. As a WebUI user, I want persisted English status labels and the last
-   conclusive result so that transient network failures do not erase useful
-   evidence.
+4. As a WebUI user, I want persisted English binary status labels and stable
+   technical reason codes so that every account remains easy to classify while
+   operational failures are still diagnosable.
 
 ## RED evidence
 
@@ -44,13 +44,15 @@ ERR_MODULE_NOT_FOUND: webui/frontend/src/eligibility.js
 ```
 
 Additional boundary tests were introduced and observed RED for dynamic custom
-method discovery, best-effort taxes, missing Plus plan evidence, log redaction,
-and checkout-session path injection before the corresponding fixes were made.
+method discovery, missing Plus plan evidence, log redaction, and
+checkout-session path injection before the corresponding fixes were made.
 
-No RED checkpoint commit was created because the governing Gate 2 requires
-explicit user confirmation before any commit.
+The method-only policy RED checkpoints are reachable from the active branch:
 
-## GCash policy-change evidence
+- `d9458e9` — classifier cases for amount/currency-independent availability;
+- `f445eb1` — minimal checkout and capability transport contract.
+
+## GCash availability policy-change evidence
 
 The requested policy change was tested before and after the classifier edit:
 
@@ -60,9 +62,29 @@ RED: 5 failures in the positive-amount, missing-evidence, and conflict cases
 GREEN: 10 tests passed after the classifier update
 ```
 
-The full backend suite then passed with 45 tests. The new cases guarantee that
-zero and positive PHP amounts are eligible, while absent GCash, missing or
-conflicting evidence, and negative amounts are conclusively ineligible.
+The proxy-aware regression was also observed RED before implementation:
+
+```text
+python -m unittest tests.test_gcash_probe -v
+RED: 3 failures
+- checkout still forced billing_details.country=PH
+- incomplete capability responses still returned unknown
+- billing-country mismatch still returned unknown
+```
+
+A controlled localhost check confirmed the old `checkout_http_400` cause was a
+billing-country/request-country mismatch. After removing the hard-coded billing
+country, the same direct egress produced a checkout method list and a conclusive
+`GCash unavailable` result instead of `unknown`. No credentials or upstream
+response bodies were stored in the evidence report.
+
+The full backend suite then passed with 59 tests. The new cases guarantee that
+the method-only decision ignores amount/currency, recognizes explicit and
+dynamic custom-method evidence, and treats absent/incomplete method evidence as
+conclusively unavailable. The checkout country follows the selected egress;
+transport/authentication failures are normalized to the requested binary
+`GCash unavailable` result while their technical reason codes remain available
+for diagnosis.
 
 ## Test specification
 
@@ -71,19 +93,21 @@ conflicting evidence, and negative amounts are conclusively ineligible.
 | 1 | Only the exact `plus-1-month-free` campaign is trial-eligible | `tests/test_eligibility.py` | Unit | PASS |
 | 2 | Active, deactivated, Free/no-offer, malformed, and missing-plan states are classified explicitly | `tests/test_eligibility.py` | Unit | PASS |
 | 3 | Authorization, cookie, and proxy credentials are redacted from diagnostic text | `tests/test_eligibility.py` | Security unit | PASS |
-| 4 | GCash requires explicit method, PHP currency, and a present non-negative amount; zero and positive amounts are eligible | `tests/test_gcash_probe.py` | Unit | PASS |
-| 5 | Missing, conflicting, negative, and wrong-currency evidence is conclusively ineligible | `tests/test_gcash_probe.py` | Unit | PASS |
-| 6 | A live custom method ID is discovered and then verified; no copied ID is embedded | `tests/test_gcash_probe.py` | Transport contract | PASS |
-| 7 | The probe calls checkout/update/taxes/resolve/Stripe only and never confirm/start | `tests/test_gcash_probe.py` | Security integration | PASS |
+| 4 | GCash availability depends only on payment-method evidence; amount and currency are diagnostics | `tests/test_gcash_probe.py` | Unit | PASS |
+| 5 | Explicit GCash, dynamic custom-method IDs, generic method lists, nested method objects, and missing evidence are classified safely | `tests/test_gcash_probe.py` | Unit | PASS |
+| 6 | Standard methods use Stripe Payment Pages init; live custom IDs use Stripe Elements, and no copied ID is embedded | `tests/test_gcash_probe.py` | Transport contract | PASS |
+| 7 | The probe calls minimal checkout/resolve/Stripe capability stages and never promotion update, taxes, confirm, or start | `tests/test_gcash_probe.py` | Security integration | PASS |
 | 8 | Upstream session IDs cannot inject a different path | `tests/test_gcash_probe.py` | Security unit | PASS |
 | 9 | API input is deduplicated and bounded, missing tokens are safe, and one failure does not abort the batch | `tests/test_eligibility_api.py` | API integration | PASS |
-| 10 | Safe results persist without a schema migration and preserve the last conclusive verdict | `tests/test_eligibility_db.py` | Database integration | PASS |
+| 10 | Safe results persist without a schema migration and normalize legacy GCash records to the binary verdict | `tests/test_eligibility_db.py`, `tests/test_gcash_binary_policy.py` | Database integration | PASS |
 | 11 | English GCash summaries, details, and status colors remain stable | `webui/frontend/tests/eligibility.test.mjs` | Frontend unit | PASS |
 | 12 | Plus requests cannot follow redirects while carrying authorization and cannot silently select another account | `tests/test_eligibility_api.py`, `tests/test_eligibility.py` | Security regression | PASS |
 | 13 | GCash requires backend side-effect acknowledgement and either loopback access or a matching reverse-proxy admin token | `tests/test_eligibility_api.py` | API security integration | PASS |
 | 14 | Concurrent Plus and GCash persistence cannot overwrite the other result | `tests/test_eligibility_db.py` | Concurrency integration | PASS |
-| 15 | A failed promotion update is inconclusive and stops before later checkout stages | `tests/test_gcash_probe.py` | Transport contract | PASS |
+| 15 | Resolve/Stripe capability failures do not erase conclusive method evidence | `tests/test_gcash_probe.py` | Transport contract | PASS |
 | 16 | Element Plus, project-owned UI text, and shipped static assets are English-only | `webui/frontend/tests/english-ui.test.mjs` | Frontend/build regression | PASS |
+| 17 | Checkout country follows the proxy/IP instead of forcing PH, preventing non-PH exits from producing a billing-country HTTP 400 | `tests/test_gcash_probe.py` | Live-regression transport contract | PASS |
+| 18 | The UI exposes the inferred checkout country/currency and explains that PH/PHP checks need a Philippines exit | `webui/frontend/tests/eligibility.test.mjs` | Frontend unit | PASS |
 
 ## GREEN evidence
 
@@ -91,7 +115,7 @@ Backend suite:
 
 ```text
 python -m unittest discover -s tests -p "test_*.py" -v
-Ran 45 tests
+Ran 59 tests
 OK
 ```
 
@@ -99,7 +123,7 @@ Frontend suite:
 
 ```text
 npm --prefix webui/frontend test
-tests 6, pass 6, fail 0
+tests 10, pass 10, fail 0
 ```
 
 Production frontend:
@@ -119,7 +143,7 @@ compileall: OK
 python -m pip check
 No broken requirements found.
 
-npm --prefix webui/frontend audit --omit=dev --package-lock-only --ignore-scripts
+npm --prefix webui/frontend audit --no-package-lock --audit-level=high
 found 0 vulnerabilities
 ```
 
@@ -130,21 +154,26 @@ standard-library `trace` module was used instead, with no new project
 dependency:
 
 ```text
-eligibility.py  93.7%
-gcash_probe.py  88.3%
+eligibility.py  100.0%
+gcash_probe.py  100.0%
 ```
 
 Both new backend modules exceed the required 80% line coverage.
 
 ## Known gaps
 
-- Tests use dependency-injected fake transports and deliberately do not contact
-  live ChatGPT or Stripe endpoints. A live result requires authorized account
-  credentials and a suitable regional proxy.
-- The upstream endpoints are not stable public APIs; unexpected response shapes
-  are treated as `ineligible` by the requested checkout-evidence policy. Pure
-  transport/authentication failures still produce `unknown` because no usable
-  evidence was obtained.
+- Most tests use dependency-injected fake transports. One controlled localhost
+  regression check was run against an authorized saved account to confirm the
+  billing-country mismatch and the fixed binary result; no payment confirmation,
+  custom-payment start, or payment execution endpoint was called.
+- GCash availability is regional checkout capability, not proof that a saved
+  GCash wallet is attached. Use a working Philippines exit to inspect the PH/PHP
+  method set. A direct or non-PH exit can conclusively report GCash unavailable
+  for that checkout region.
+- The upstream endpoints are not stable public APIs; successful responses with
+  absent or incomplete method evidence, as well as transport/authentication
+  failures, are treated as unavailable by the requested binary policy. Stable
+  decision/status fields retain the operational reason.
 - The existing application has no built-in WebUI authentication or global rate
   limiter. It should remain bound to localhost or be placed behind an
   authenticated TLS reverse proxy.
@@ -154,5 +183,6 @@ Both new backend modules exceed the required 80% line coverage.
 
 ## Merge evidence
 
-RED and GREEN were both captured in this report. The change remains uncommitted
-until the user approves Gate 2.
+RED is preserved in `d9458e9`, `f445eb1`, `ec8bfb1`, and `131fcf2`. GREEN is
+captured by the commands above and by the following implementation checkpoint
+commit on this branch.

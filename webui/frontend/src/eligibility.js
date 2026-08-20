@@ -1,9 +1,5 @@
 export function gcashStatusType(classification) {
-  return {
-    eligible: 'success',
-    ineligible: 'warning',
-    unknown: 'info',
-  }[classification] || 'info'
+  return classification === 'eligible' ? 'success' : 'warning'
 }
 
 export function gcashProbeRequestConfig() {
@@ -16,29 +12,33 @@ export function gcashProbeRequestConfig() {
 }
 
 export function summarizeGCash(results) {
-  const counts = { eligible: 0, ineligible: 0, unknown: 0 }
+  const counts = { eligible: 0, ineligible: 0 }
   for (const result of Object.values(results || {})) {
-    const classification = result?.classification
-    counts[classification in counts ? classification : 'unknown'] += 1
+    counts[result?.classification === 'eligible' ? 'eligible' : 'ineligible'] += 1
   }
   return {
     counts,
-    text: `Completed: ${counts.eligible} eligible, ${counts.ineligible} ineligible, ${counts.unknown} unknown`,
+    text: `Completed: ${counts.eligible} available, ${counts.ineligible} unavailable`,
   }
+}
+
+export function gcashDisplayLabel(check) {
+  if (!check) return ''
+  return check.classification === 'eligible' || check.eligible === true ||
+    check.method_available === true || check.label === 'GCash eligible' ||
+    check.label === 'GCash available'
+    ? 'GCash available'
+    : 'GCash unavailable'
 }
 
 export function formatGCashDetail(check, formatTime = (value) => String(value)) {
   if (!check) return ''
   const parts = []
   if (check.decision) parts.push(`Decision: ${check.decision}`)
-  if (check.amount_minor !== undefined && check.amount_minor !== null) {
-    parts.push(`Amount: ${check.amount_minor} ${check.currency || ''}`.trim())
-  } else if (check.currency) {
-    parts.push(`Currency: ${check.currency}`)
+  parts.push(`Method: ${gcashDisplayLabel(check)}`)
+  if (check.checkout_country || check.currency) {
+    parts.push(`Checkout: ${[check.checkout_country, check.currency].filter(Boolean).join(' / ')}`)
   }
   if (check.checked_at) parts.push(`Checked: ${formatTime(check.checked_at)}`)
-  if (check.classification === 'unknown' && check.last_conclusive?.classification) {
-    parts.push(`Last conclusive: ${check.last_conclusive.classification}`)
-  }
   return parts.join(' · ')
 }
