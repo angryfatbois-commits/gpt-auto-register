@@ -43,7 +43,7 @@ def _gcash_payload(amount=0, currency="php"):
 
 class GCashClassificationTests(unittest.TestCase):
     def test_explicit_gcash_zero_due_php_is_eligible(self):
-        result = classify_gcash_evidence([_gcash_payload()], require_zero=True, checked_at=10.0)
+        result = classify_gcash_evidence([_gcash_payload()], checked_at=10.0)
 
         self.assertEqual(result["classification"], "eligible")
         self.assertTrue(result["eligible"])
@@ -54,12 +54,13 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertEqual(result["status"], "eligible")
         self.assertEqual(result["label"], "GCash eligible")
 
-    def test_nonzero_offer_is_conclusively_ineligible(self):
+    def test_explicit_gcash_positive_due_php_is_eligible(self):
         result = classify_gcash_evidence([_gcash_payload(amount=115000)])
 
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertEqual(result["decision"], "nonzero_offer")
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["eligible"])
+        self.assertEqual(result["decision"], "gcash_available")
+        self.assertEqual(result["amount_minor"], 115000)
 
     def test_wrong_currency_is_conclusively_ineligible(self):
         result = classify_gcash_evidence([_gcash_payload(currency="usd")])
@@ -79,7 +80,7 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "ineligible")
         self.assertEqual(result["decision"], "gcash_unavailable")
 
-    def test_missing_amount_is_unknown_when_zero_is_required(self):
+    def test_missing_amount_is_ineligible(self):
         payload = {
             "currency": "php",
             "custom_payment_method_data": [
@@ -89,16 +90,56 @@ class GCashClassificationTests(unittest.TestCase):
 
         result = classify_gcash_evidence([payload])
 
-        self.assertEqual(result["classification"], "unknown")
-        self.assertIsNone(result["eligible"])
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
         self.assertEqual(result["decision"], "amount_unknown")
-        self.assertTrue(result["retryable"])
+        self.assertTrue(result["conclusive"])
+        self.assertFalse(result["retryable"])
 
-    def test_conflicting_amounts_are_unknown(self):
+    def test_conflicting_amounts_are_ineligible(self):
         result = classify_gcash_evidence([_gcash_payload(0), _gcash_payload(100)])
 
-        self.assertEqual(result["classification"], "unknown")
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
         self.assertEqual(result["decision"], "conflicting_amount_evidence")
+
+    def test_conflicting_currencies_are_ineligible(self):
+        result = classify_gcash_evidence([
+            _gcash_payload(0, "php"),
+            _gcash_payload(0, "usd"),
+        ])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["decision"], "conflicting_currency_evidence")
+
+    def test_negative_amount_is_ineligible(self):
+        result = classify_gcash_evidence([_gcash_payload(amount=-1)])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["decision"], "invalid_amount")
+
+    def test_missing_method_evidence_is_ineligible(self):
+        result = classify_gcash_evidence([{"currency": "php", "amount_due": 0}])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["decision"], "gcash_evidence_missing")
+
+    def test_missing_currency_is_ineligible(self):
+        payload = {
+            "amount_due": 0,
+            "custom_payment_method_data": [
+                {"id": "cpmt_discovered", "display_name": "GCash"}
+            ],
+        }
+
+        result = classify_gcash_evidence([payload])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["decision"], "currency_unknown")
 
 
 class GCashNetworkProbeTests(unittest.TestCase):
