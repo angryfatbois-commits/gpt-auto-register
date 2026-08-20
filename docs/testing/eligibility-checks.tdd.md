@@ -50,6 +50,20 @@ and checkout-session path injection before the corresponding fixes were made.
 No RED checkpoint commit was created because the governing Gate 2 requires
 explicit user confirmation before any commit.
 
+## GCash policy-change evidence
+
+The requested policy change was tested before and after the classifier edit:
+
+```text
+python -m unittest tests.test_gcash_probe.GCashClassificationTests -v
+RED: 5 failures in the positive-amount, missing-evidence, and conflict cases
+GREEN: 10 tests passed after the classifier update
+```
+
+The full backend suite then passed with 45 tests. The new cases guarantee that
+zero and positive PHP amounts are eligible, while absent GCash, missing or
+conflicting evidence, and negative amounts are conclusively ineligible.
+
 ## Test specification
 
 | # | What is guaranteed | Test target | Type | Result |
@@ -57,8 +71,8 @@ explicit user confirmation before any commit.
 | 1 | Only the exact `plus-1-month-free` campaign is trial-eligible | `tests/test_eligibility.py` | Unit | PASS |
 | 2 | Active, deactivated, Free/no-offer, malformed, and missing-plan states are classified explicitly | `tests/test_eligibility.py` | Unit | PASS |
 | 3 | Authorization, cookie, and proxy credentials are redacted from diagnostic text | `tests/test_eligibility.py` | Security unit | PASS |
-| 4 | GCash requires explicit method, PHP currency, and zero-due evidence | `tests/test_gcash_probe.py` | Unit | PASS |
-| 5 | Missing, conflicting, nonzero, and wrong-currency evidence cannot become eligible | `tests/test_gcash_probe.py` | Unit | PASS |
+| 4 | GCash requires explicit method, PHP currency, and a present non-negative amount; zero and positive amounts are eligible | `tests/test_gcash_probe.py` | Unit | PASS |
+| 5 | Missing, conflicting, negative, and wrong-currency evidence is conclusively ineligible | `tests/test_gcash_probe.py` | Unit | PASS |
 | 6 | A live custom method ID is discovered and then verified; no copied ID is embedded | `tests/test_gcash_probe.py` | Transport contract | PASS |
 | 7 | The probe calls checkout/update/taxes/resolve/Stripe only and never confirm/start | `tests/test_gcash_probe.py` | Security integration | PASS |
 | 8 | Upstream session IDs cannot inject a different path | `tests/test_gcash_probe.py` | Security unit | PASS |
@@ -77,7 +91,7 @@ Backend suite:
 
 ```text
 python -m unittest discover -s tests -p "test_*.py" -v
-Ran 37 tests
+Ran 45 tests
 OK
 ```
 
@@ -128,7 +142,9 @@ Both new backend modules exceed the required 80% line coverage.
   live ChatGPT or Stripe endpoints. A live result requires authorized account
   credentials and a suitable regional proxy.
 - The upstream endpoints are not stable public APIs; unexpected response shapes
-  intentionally produce `unknown` rather than optimistic eligibility.
+  are treated as `ineligible` by the requested checkout-evidence policy. Pure
+  transport/authentication failures still produce `unknown` because no usable
+  evidence was obtained.
 - The existing application has no built-in WebUI authentication or global rate
   limiter. It should remain bound to localhost or be placed behind an
   authenticated TLS reverse proxy.

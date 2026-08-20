@@ -169,7 +169,14 @@ def classify_gcash_evidence(
     require_zero: bool = True,
     checked_at: float | None = None,
 ) -> dict[str, Any]:
-    """Classify only explicit GCash, amount, and currency evidence."""
+    """Classify explicit GCash, currency, and amount evidence.
+
+    ``require_zero`` is retained for backwards compatibility with older
+    callers, but the current policy accepts both zero and positive amounts.
+    Missing, conflicting, or otherwise invalid evidence is a conclusive
+    ``ineligible`` result rather than an optimistic or retryable verdict.
+    """
+    del require_zero
     evidence = _evidence(payloads)
     method = evidence["method_available"]
     amounts = evidence["amounts"]
@@ -192,51 +199,38 @@ def classify_gcash_evidence(
         "currency": currency,
     }
 
+    def mark_ineligible(decision: str, label: str = "GCash ineligible") -> None:
+        result.update({
+            "classification": "ineligible",
+            "eligible": False,
+            "decision": decision,
+            "conclusive": True,
+            "retryable": False,
+            "status": "ineligible",
+            "label": label,
+        })
+
     if len(amounts) > 1:
-        result["decision"] = "conflicting_amount_evidence"
+        mark_ineligible("conflicting_amount_evidence")
     elif len(currencies) > 1:
-        result["decision"] = "conflicting_currency_evidence"
+        mark_ineligible("conflicting_currency_evidence")
     elif method is False:
-        result.update({
-            "classification": "ineligible",
-            "eligible": False,
-            "decision": "gcash_unavailable",
-            "conclusive": True,
-            "retryable": False,
-            "status": "ineligible",
-            "label": "GCash unavailable",
-        })
+        mark_ineligible("gcash_unavailable", "GCash unavailable")
     elif method is None:
-        result["decision"] = "gcash_evidence_missing"
+        mark_ineligible("gcash_evidence_missing")
     elif not currency:
-        result["decision"] = "currency_unknown"
+        mark_ineligible("currency_unknown")
     elif currency != _EXPECTED_CURRENCY:
-        result.update({
-            "classification": "ineligible",
-            "eligible": False,
-            "decision": "currency_mismatch",
-            "conclusive": True,
-            "retryable": False,
-            "status": "ineligible",
-            "label": "GCash ineligible",
-        })
-    elif require_zero and amount is None:
-        result["decision"] = "amount_unknown"
-    elif require_zero and amount != 0:
-        result.update({
-            "classification": "ineligible",
-            "eligible": False,
-            "decision": "nonzero_offer",
-            "conclusive": True,
-            "retryable": False,
-            "status": "ineligible",
-            "label": "GCash ineligible - nonzero offer",
-        })
+        mark_ineligible("currency_mismatch")
+    elif amount is None:
+        mark_ineligible("amount_unknown")
+    elif amount < 0:
+        mark_ineligible("invalid_amount")
     else:
         result.update({
             "classification": "eligible",
             "eligible": True,
-            "decision": "gcash_zero_due_available" if require_zero else "gcash_available",
+            "decision": "gcash_zero_due_available" if amount == 0 else "gcash_available",
             "conclusive": True,
             "retryable": False,
             "status": "eligible",

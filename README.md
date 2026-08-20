@@ -146,15 +146,24 @@ execution operation. It never submits a GCash account or authorizes a charge.
 Creating and updating a checkout is still a remote side effect, so the WebUI
 always requires an explicit confirmation before it runs.
 
-By default, `eligible` requires explicit evidence that:
+`eligible` requires explicit evidence that:
 
 - the custom method is GCash;
 - the checkout currency is PHP; and
-- the amount due is zero.
+- the amount is present and non-negative (both zero and positive amounts are
+  accepted).
 
-Missing or contradictory evidence is `unknown`, not guessed as eligible. The
-custom payment method ID is discovered from live responses; the application
-does not embed an ID copied from another repository.
+The current policy is deliberately binary for checkout evidence:
+
+- GCash + PHP + amount `0` or greater -> `eligible`;
+- GCash absent, a non-PHP currency, missing fields, negative amounts, or
+  conflicting evidence -> `ineligible`.
+
+Operational failures such as an invalid access token, transport error, or
+unusable upstream response remain `unknown` because no checkout evidence was
+successfully obtained. The custom payment method ID is discovered from live
+responses; the application does not embed an ID copied from another
+repository.
 
 ### Proxy behavior
 
