@@ -81,6 +81,20 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "ineligible")
         self.assertEqual(result["decision"], "gcash_unavailable")
 
+    def test_nested_explicit_gcash_method_is_available(self):
+        result = classify_gcash_evidence([
+            {
+                "elements_options": {
+                    "ordered_payment_method_types": [
+                        {"payment_method_type": "GCash"},
+                    ],
+                },
+            }
+        ])
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["method_available"])
+
     def test_missing_amount_is_irrelevant_to_method_detection(self):
         payload = {
             "currency": "php",
@@ -194,8 +208,6 @@ class GCashNetworkProbeTests(unittest.TestCase):
         }
         session = FakeSession([
             FakeResponse(checkout),
-            FakeResponse({"total_summary": {"due": 0}, "currency": "php"}),
-            FakeResponse({"total_summary": {"due": 0}, "currency": "php"}),
             FakeResponse({
                 "custom_payment_methods": ["cpmt_dynamic_from_checkout"],
                 "total_summary": {"due": 0},
@@ -216,47 +228,28 @@ class GCashNetworkProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 5)
+        self.assertEqual(len(session.calls), 3)
+        checkout_call = session.calls[0]
+        self.assertNotIn("promo_campaign", checkout_call[2]["json"])
+        self.assertNotIn("check_card_proxy", checkout_call[2]["json"])
         stripe_call = session.calls[-1]
-        self.assertEqual(stripe_call[1], "https://api.stripe.com/v1/elements/sessions")
         self.assertEqual(
-            stripe_call[2]["params"]["custom_payment_methods[0]"],
+            stripe_call[1],
+            "https://api.stripe.com/v1/payment_pages/cs_test_dynamic_method/init",
+        )
+        self.assertEqual(
+            stripe_call[2]["data"]["custom_payment_methods[0]"],
             "cpmt_dynamic_from_checkout",
         )
 
-    def test_failed_promotion_update_is_inconclusive_and_stops_the_probe(self):
+    def test_probe_does_not_send_promotion_or_tax_requests(self):
         checkout = {
-            "checkout_session_id": "cs_test_promotion_failure",
+            "checkout_session_id": "cs_test_method_only",
             "processor_entity": "openai_ie",
             **_gcash_payload(),
         }
         session = FakeSession([
             FakeResponse(checkout),
-            FakeResponse({"message": "temporary"}, status_code=503),
-            FakeResponse(_gcash_payload()),
-            FakeResponse(_gcash_payload()),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "unknown")
-        self.assertEqual(result["decision"], "promotion_update_http_503")
-        self.assertTrue(result["retryable"])
-        self.assertEqual(len(session.calls), 2)
-
-    def test_tax_failure_is_best_effort_when_resolve_has_conclusive_evidence(self):
-        checkout = {
-            "checkout_session_id": "cs_test_optional_tax",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"total_summary": {"due": 0}, "currency": "php"}),
-            FakeResponse({"message": "temporary"}, status_code=503),
             FakeResponse(_gcash_payload()),
         ])
 
@@ -266,7 +259,31 @@ class GCashNetworkProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(len(session.calls), 2)
+        self.assertNotIn("promo_campaign", session.calls[0][2]["json"])
+        self.assertNotIn("check_card_proxy", session.calls[0][2]["json"])
+        urls = [url for _, url, _ in session.calls]
+        self.assertFalse(any(url.endswith("/payments/checkout/update") for url in urls))
+        self.assertFalse(any(url.endswith("/payments/checkout/taxes") for url in urls))
+
+    def test_explicit_checkout_evidence_survives_resolve_failure(self):
+        checkout = {
+            "checkout_session_id": "cs_test_resolve_failure",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"message": "temporary"}, status_code=503),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(len(session.calls), 2)
 
     def test_probe_stops_before_any_payment_execution_endpoint(self):
         checkout = {
@@ -276,14 +293,10 @@ class GCashNetworkProbeTests(unittest.TestCase):
             "customer_session_client_secret": "cuss_secret_not_returned",
             **_gcash_payload(),
         }
-        update = {"total_summary": {"due": 0}, "currency": "php"}
-        taxes = {"total_summary": {"due": 0}, "currency": "php"}
         resolved = _gcash_payload()
         stripe = _gcash_payload()
         session = FakeSession([
             FakeResponse(checkout),
-            FakeResponse(update),
-            FakeResponse(taxes),
             FakeResponse(resolved),
             FakeResponse(stripe),
         ])
@@ -307,12 +320,10 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["proxy"], "socks5://proxy-user:proxy-pass@example.test:1080")
         self.assertTrue(session.closed)
         urls = [url for _, url, _ in session.calls]
-        self.assertEqual(len(urls), 5)
+        self.assertEqual(len(urls), 3)
         self.assertTrue(any(url.endswith("/payments/checkout") for url in urls))
-        self.assertTrue(any(url.endswith("/payments/checkout/update") for url in urls))
-        self.assertTrue(any(url.endswith("/payments/checkout/taxes") for url in urls))
         self.assertTrue(any("/payments/checkout/openai_ie/cs_test_safe_probe" in url for url in urls))
-        self.assertTrue(any(url == "https://api.stripe.com/v1/elements/sessions" for url in urls))
+        self.assertTrue(any("/v1/payment_pages/cs_test_safe_probe/init" in url for url in urls))
         self.assertFalse(any("confirm" in url or "custom_payment_method/start" in url for url in urls))
         self.assertTrue(all(call[2]["allow_redirects"] is False for call in session.calls))
         serialized = repr(result)
