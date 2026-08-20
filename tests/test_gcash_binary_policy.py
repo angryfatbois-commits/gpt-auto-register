@@ -1,9 +1,14 @@
+import gc
+import json
+import tempfile
 import unittest
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
 
 from gcash_probe import probe_gcash
+from webui import db
 from webui.app import CheckGCashReq, api_check_gcash
 
 
@@ -74,6 +79,53 @@ class GCashBinaryPolicyTests(unittest.TestCase):
         persist.assert_called_once_with(
             "person@example.com", "gcash_check", result
         )
+
+
+class GCashLegacyResultTests(unittest.TestCase):
+    def setUp(self):
+        self._original_db_path = db.DB_PATH
+        self._temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        db.DB_PATH = Path(self._temp_dir.name) / "test.db"
+        db.init_db()
+        db.save_registered({
+            "email": "legacy@example.com",
+            "access_token": "access-token",
+        })
+
+    def tearDown(self):
+        db.DB_PATH = self._original_db_path
+        gc.collect()
+        self._temp_dir.cleanup()
+
+    def test_saved_legacy_unknown_is_read_as_binary_unavailable(self):
+        legacy = {
+            "gcash_check": {
+                "classification": "unknown",
+                "eligible": None,
+                "conclusive": False,
+                "decision": "checkout_transport_error",
+                "status": "unknown",
+                "label": "GCash status unknown",
+            }
+        }
+        con = db._conn()
+        try:
+            con.execute(
+                "UPDATE registered SET extra_json=? WHERE email=?",
+                (json.dumps(legacy), "legacy@example.com"),
+            )
+            con.commit()
+        finally:
+            con.close()
+
+        result = db.list_registered()[0]["gcash_check"]
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertTrue(result["conclusive"])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["label"], "GCash unavailable")
+        self.assertEqual(result["decision"], "checkout_transport_error")
 
 
 if __name__ == "__main__":
