@@ -10,6 +10,7 @@ logger = logging.getLogger(__name__)
 
 # Prefer curl_cffi because it provides TLS fingerprint impersonation.
 try:
+    from curl_cffi import requests as cffi_requests
     from curl_cffi.requests import Session as CffiSession
 
     _HAS_CFFI = True
@@ -56,10 +57,17 @@ class _TlsRetrySession:
     when iterating session.cookies; this wrapper does not change that behavior.
     """
 
-    def __init__(self, inner, retries: int = 2, backoff: float = 1.5):
+    def __init__(
+        self,
+        inner,
+        retries: int = 2,
+        backoff: float = 1.5,
+        impersonate: str = "",
+    ):
         object.__setattr__(self, "_inner", inner)
         object.__setattr__(self, "_retries", max(0, int(retries)))
         object.__setattr__(self, "_backoff", float(backoff))
+        object.__setattr__(self, "_impersonate", str(impersonate or ""))
 
     # Forward all reads and writes other than get/post to the real session.
     def __getattr__(self, name):
@@ -101,6 +109,43 @@ class _TlsRetrySession:
     def post(self, *args, **kwargs):
         return self._call_with_retry("post", *args, **kwargs)
 
+    def post_isolated(self, *args, **kwargs):
+        """POST without inheriting the session cookie jar.
+
+        ChatGPT checkout requests already provide the account cookie header
+        explicitly. A functional curl request prevents Cloudflare cookies that
+        a long-lived Session may have collected from being merged into that
+        header. TLS retries keep the same proxy and browser profile.
+        """
+        inner = object.__getattribute__(self, "_inner")
+        retries = object.__getattribute__(self, "_retries")
+        backoff = object.__getattribute__(self, "_backoff")
+        impersonate = object.__getattribute__(self, "_impersonate")
+        request_kwargs = dict(kwargs)
+        request_kwargs["proxies"] = dict(getattr(inner, "proxies", {}) or {})
+        if impersonate:
+            request_kwargs["impersonate"] = impersonate
+
+        import time
+
+        for attempt in range(retries + 1):
+            try:
+                return cffi_requests.post(*args, **request_kwargs)
+            except Exception as exc:
+                if not _is_tls_handshake_error(exc) or attempt >= retries:
+                    raise
+                wait = backoff * (attempt + 1)
+                url = args[0] if args else request_kwargs.get("url", "?")
+                logger.warning(
+                    "Transient TLS failure on isolated POST; retrying through "
+                    "the same route in %.1fs (%d/%d): %s",
+                    wait,
+                    attempt + 1,
+                    retries,
+                    str(url)[:80],
+                )
+                time.sleep(wait)
+
     def put(self, *args, **kwargs):
         return self._call_with_retry("put", *args, **kwargs)
 
@@ -128,7 +173,7 @@ def create_http_session(
             session.proxies = {"https": "", "http": ""}
         # Same-session retries recovered all observed transient TLS failures.
         # Wrapping here covers both auth_flow and Sentinel calls.
-        return _TlsRetrySession(session)
+        return _TlsRetrySession(session, impersonate=impersonate)
     else:
         session = requests.Session()
         session.trust_env = False

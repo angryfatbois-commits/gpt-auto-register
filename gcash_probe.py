@@ -31,10 +31,16 @@ CHECKOUT_UPDATE_PATH = "/backend-api/payments/checkout/update"
 CHECKOUT_UPDATE_URL = f"https://chatgpt.com{CHECKOUT_UPDATE_PATH}"
 CHECKOUT_TAXES_PATH = "/backend-api/payments/checkout/taxes"
 CHECKOUT_TAXES_URL = f"https://chatgpt.com{CHECKOUT_TAXES_PATH}"
+_CHATGPT_IMPERSONATE = "chrome146"
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/146.0.0.0 Safari/537.36"
 )
+_CHATGPT_SEC_CH_UA = (
+    '"Chromium";v="146", "Google Chrome";v="146", "Not.A/Brand";v="99"'
+)
+_CHATGPT_CLIENT_VERSION = "prod-fb4a8a2a751dfec391053cfd7b01c52699ccf78c"
+_CHATGPT_CLIENT_BUILD = "8370486"
 _FIREFOX_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
     "Gecko/20100101 Firefox/144.0"
@@ -585,15 +591,27 @@ def _chatgpt_headers(
     device_id: str,
     cookie_header: str,
     route: str,
+    session_id: str,
 ) -> dict[str, str]:
     headers = {
-        "Accept": "application/json",
+        "Accept": "*/*",
+        "Accept-Language": "en-US,en;q=0.9",
         "Content-Type": "application/json",
         "Authorization": f"Bearer {access_token}",
         "Origin": "https://chatgpt.com",
         "Referer": "https://chatgpt.com/",
         "User-Agent": _USER_AGENT,
         "OAI-Device-Id": device_id,
+        "oai-language": "en-US",
+        "oai-session-id": session_id,
+        "oai-client-version": _CHATGPT_CLIENT_VERSION,
+        "oai-client-build-number": _CHATGPT_CLIENT_BUILD,
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "sec-ch-ua": _CHATGPT_SEC_CH_UA,
+        "sec-ch-ua-mobile": "?0",
+        "sec-ch-ua-platform": '"Windows"',
         "x-openai-target-path": route,
         "x-openai-target-route": route,
     }
@@ -649,7 +667,10 @@ def _post_json(
     stage: str,
 ) -> Mapping[str, Any]:
     try:
-        response = session.post(
+        post = getattr(session, "post_isolated", None)
+        if not callable(post):
+            post = session.post
+        response = post(
             url,
             json=dict(payload),
             headers=dict(headers),
@@ -996,6 +1017,7 @@ def probe_gcash(
         )
     timeout = max(5, min(int(timeout or 30), 60))
     stable_device_id = str(device_id or "").strip() or str(uuid.uuid4())
+    stable_session_id = str(uuid.uuid4())
     if session_factory is None:
         from http_client import create_http_session
 
@@ -1013,7 +1035,7 @@ def probe_gcash(
     try:
         session = session_factory(
             proxy=str(proxy or "").strip() or None,
-            impersonate="chrome110",
+            impersonate=_CHATGPT_IMPERSONATE,
         )
         checkout_route = "/backend-api/payments/checkout"
         stage = "checkout"
@@ -1023,6 +1045,7 @@ def probe_gcash(
             device_id=stable_device_id,
             cookie_header=cookie_header,
             route=checkout_route,
+            session_id=stable_session_id,
         )
         try:
             checkout = _post_json(
@@ -1039,8 +1062,9 @@ def probe_gcash(
             # later. Some otherwise valid accounts reject the richer create
             # payload with a generic 400/422 even though their browser checkout
             # exposes GCash. Retry that exact compatibility shape once with a
-            # fresh fingerprint. Never retry a known country mismatch, never
-            # remove PH/PHP, and never fall back outside the selected proxy.
+            # fresh transport while retaining the stable browser identity.
+            # Never retry a known country mismatch, never remove PH/PHP, and
+            # never fall back outside the selected proxy.
             if exc.code not in {"checkout_http_400", "checkout_http_422"}:
                 raise
             _LOGGER.info(
@@ -1053,15 +1077,13 @@ def probe_gcash(
                 pass
             session = session_factory(
                 proxy=str(proxy or "").strip() or None,
-                impersonate="firefox144",
+                impersonate=_CHATGPT_IMPERSONATE,
             )
-            compatibility_headers = dict(checkout_headers)
-            compatibility_headers["User-Agent"] = _FIREFOX_USER_AGENT
             checkout = _post_json(
                 session,
                 f"{CHATGPT_PAYMENTS_BASE}/checkout",
                 _method_only_checkout_payload(),
-                compatibility_headers,
+                checkout_headers,
                 timeout,
                 stage,
             )
@@ -1082,6 +1104,7 @@ def probe_gcash(
                 device_id=stable_device_id,
                 cookie_header=cookie_header,
                 route=update_route,
+                session_id=stable_session_id,
             )
             update_headers["Referer"] = checkout_referer
             updated = _post_json(
@@ -1108,6 +1131,7 @@ def probe_gcash(
                 device_id=stable_device_id,
                 cookie_header=cookie_header,
                 route=taxes_route,
+                session_id=stable_session_id,
             )
             taxes_headers["Referer"] = checkout_referer
             taxes = _post_json(
@@ -1142,6 +1166,7 @@ def probe_gcash(
                     device_id=stable_device_id,
                     cookie_header=cookie_header,
                     route=resolve_route,
+                    session_id=stable_session_id,
                 ),
                 timeout=timeout,
                 stage=stage,
