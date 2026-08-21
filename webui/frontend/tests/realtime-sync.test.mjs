@@ -94,24 +94,26 @@ async function loadStatsHarness() {
 }
 
 
-test('automatic workers keep independent live-log streams', async () => {
+test('automatic worker logs are multiplexed through one scalable EventSource', async () => {
   const { store, connections } = await loadRuntimeHarness()
   store.connectAutoStream()
   const automatic = connections[0]
 
   automatic.handlers.run_started(message({ run_id: 'run-one', email: 'one@example.com' }))
-  const first = connections.find((item) => item.path.includes('run-one'))
   automatic.handlers.run_started(message({ run_id: 'run-two', email: 'two@example.com' }))
-  const second = connections.find((item) => item.path.includes('run-two'))
-
-  assert.ok(first)
-  assert.ok(second)
-  assert.equal(first.closed, false, 'starting worker two must not close worker one')
-  assert.equal(second.closed, false)
+  assert.equal(
+    connections.length,
+    1,
+    'batch concurrency must not exceed the browser HTTP/1.1 connection limit',
+  )
   assert.equal(store.runningSingle.value, false, 'automatic workers must not change manual-run state')
 
-  first.handlers.log(message({ line: 'worker one live line' }))
-  second.handlers.log(message({ line: 'worker two live line' }))
+  automatic.handlers.run_event(message({
+    run_id: 'run-one', event: 'log', data: { line: 'worker one live line' },
+  }))
+  automatic.handlers.run_event(message({
+    run_id: 'run-two', event: 'log', data: { line: 'worker two live line' },
+  }))
   assert.ok(store.logs.value.some((entry) => entry.text === 'worker one live line'))
   assert.ok(store.logs.value.some((entry) => entry.text === 'worker two live line'))
 })
@@ -130,7 +132,7 @@ test('automatic state snapshots immediately reconcile pool statistics and cached
 })
 
 
-test('a reconnect recovers live logs for workers already present in the state snapshot', async () => {
+test('a reconnect keeps active-worker state without opening per-run connections', async () => {
   const { store, connections } = await loadRuntimeHarness()
   store.connectAutoStream()
   const automatic = connections[0]
@@ -141,25 +143,21 @@ test('a reconnect recovers live logs for workers already present in the state sn
     workers: [{ run_id: 'already-running', email: 'active@example.com' }],
   }))
 
-  assert.ok(
-    connections.some((item) => item.path === '/api/runs/already-running/stream'),
-    'the state snapshot must recover a run_started event missed before connection',
-  )
+  assert.equal(store.autoStatus.value.workers[0].run_id, 'already-running')
+  assert.equal(connections.length, 1)
 })
 
 
 test('an automatic run stream error performs a final data reconciliation', async () => {
   const { store, connections, statsStore } = await loadRuntimeHarness()
-  store.connectAutoStream()
-  const automatic = connections[0]
-  automatic.handlers.run_started(message({ run_id: 'run-error', email: 'error@example.com' }))
-  const run = connections.find((item) => item.path.includes('run-error'))
+  const run = store.streamRun('run-error')
   const versionBeforeError = store.dataVersion.value
+  const refreshesBeforeError = statsStore.refreshCalls
 
   run.onError(new Event('error'))
 
   assert.equal(run.closed, true)
-  assert.equal(statsStore.refreshCalls, 1)
+  assert.equal(statsStore.refreshCalls, refreshesBeforeError + 1)
   assert.equal(store.dataVersion.value, versionBeforeError + 1)
   assert.equal(store.runningSingle.value, false)
 })
