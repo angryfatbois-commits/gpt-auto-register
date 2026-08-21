@@ -2,6 +2,7 @@ import unittest
 import warnings
 import gc
 import tempfile
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -169,6 +170,66 @@ class GCashEligibilityApiTests(unittest.TestCase):
         self.assertEqual(probe.call_args.kwargs["access_token"], "access-token")
         self.assertEqual(probe.call_args.kwargs["checkout_email"], "person@example.com")
         persist.assert_called_once_with("person@example.com", "gcash_check", probe_result)
+
+    def test_uses_oai_did_cookie_when_persisted_device_id_is_missing(self):
+        cookie_device_id = "11111111-2222-4333-8444-555555555555"
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "",
+            "cookie_header": (
+                "__Secure-next-auth.session-token=session-secret; "
+                f"oai-did={cookie_device_id}; oai-sc=scope-cookie"
+            ),
+        }
+        probe_result = {
+            "operation": "gcash_payment_eligibility",
+            "check_scope": "payment_method_only",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "gcash_available",
+            "status": "eligible",
+            "label": "GCash available",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch("webui.app.probe_gcash", return_value=probe_result) as probe, \
+             patch("webui.app.db.update_eligibility_check"):
+            api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        self.assertEqual(probe.call_args.kwargs["device_id"], cookie_device_id)
+
+    def test_rejects_an_invalid_oai_did_cookie_before_building_headers(self):
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "",
+            "cookie_header": "oai-did=invalid-device\r\nInjected: value",
+        }
+        probe_result = {
+            "classification": "ineligible",
+            "eligible": False,
+            "conclusive": True,
+            "decision": "gcash_unavailable",
+            "status": "ineligible",
+            "label": "GCash unavailable",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch("webui.app.probe_gcash", return_value=probe_result) as probe, \
+             patch("webui.app.db.update_eligibility_check"):
+            api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        device_id = probe.call_args.kwargs["device_id"]
+        self.assertEqual(str(uuid.UUID(device_id)), device_id)
+        self.assertNotIn("Injected", device_id)
 
     def test_missing_access_token_is_unavailable_without_calling_probe(self):
         with patch("webui.app.db.get_registered", return_value={"email": "person@example.com"}), \

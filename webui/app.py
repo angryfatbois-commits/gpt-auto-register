@@ -1209,6 +1209,23 @@ def _require_local_confirmed_gcash_request(request: Request) -> None:
         )
 
 
+def _gcash_device_id(credential: dict, email: str) -> str:
+    """Keep the checkout device header consistent with the stored cookie jar."""
+    cookie_header = str(credential.get("cookie_header") or "")
+    for part in cookie_header.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name.strip().lower() == "oai-did":
+            try:
+                return str(uuid.UUID(value.strip()))
+            except (AttributeError, ValueError):
+                break
+
+    persisted = str(credential.get("device_id") or "").strip()
+    if persisted:
+        return persisted
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"gpt-auto-register-gcash:{email}"))
+
+
 # OpenAI uses several phrases for deactivation in 401/403 response bodies.
 # Match lowercase substrings here and log unmatched body metadata for extension.
 _DEACTIVATED_MARKERS = (
@@ -1449,9 +1466,7 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         account_id = str(
             claims.get("chatgpt_account_id") or claims.get("account_id") or ""
         ).strip()
-        device_id = str(credential.get("device_id") or "").strip() or str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, f"gpt-auto-register-gcash:{email}")
-        )
+        device_id = _gcash_device_id(credential, email)
         try:
             result = normalize_gcash_result(probe_gcash(
                 access_token=access_token,
