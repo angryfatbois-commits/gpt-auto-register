@@ -30,6 +30,7 @@ const page = ref(1)
 const filter = ref('all')
 const selected = ref([])
 const loading = ref(false)
+let loadRequest = 0
 const checking = ref(false)
 const checkResult = ref('')
 const gcashChecking = ref(false)
@@ -47,15 +48,20 @@ function gcashOf(row) { return row.gcash_check || null }
 
 async function load(resetPage) {
   if (resetPage) page.value = 1
+  const request = ++loadRequest
   loading.value = true
   try {
     const { items, total: t } = await listRegistered({
       limit: PAGE_SIZE, offset: (page.value - 1) * PAGE_SIZE, filter: filter.value,
     })
+    if (request !== loadRequest) return
     rows.value = items
     total.value = t
-  } catch (e) { ElMessage.error(e.message) }
-  finally { loading.value = false }
+  } catch (e) {
+    if (request !== loadRequest) return
+    ElMessage.error(e.message)
+  }
+  finally { if (request === loadRequest) loading.value = false }
 }
 
 function collectEmails(mode) {

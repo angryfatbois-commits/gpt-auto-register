@@ -22,6 +22,7 @@ export const useStatsStore = defineStore('stats', () => {
   const stats = ref({ total: 0, available: 0, in_use: 0, done: 0, failed: 0 })
   let timer = null
   let revision = 0
+  let refreshRequest = 0
 
   function applySnapshot(snapshot) {
     const next = normalizeSnapshot(snapshot)
@@ -35,11 +36,12 @@ export const useStatsStore = defineStore('stats', () => {
   }
 
   async function refresh() {
+    const request = ++refreshRequest
     const startingRevision = revision
     try {
       const { stats: s } = await getStats()
       // Do not let a slow polling response overwrite a newer SSE snapshot.
-      if (s && revision === startingRevision) applySnapshot(s)
+      if (s && request === refreshRequest && revision === startingRevision) applySnapshot(s)
     } catch (e) {
       // Keep polling failures silent so they do not interrupt the user.
       console.error('stats refresh:', e)

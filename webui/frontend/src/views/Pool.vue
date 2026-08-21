@@ -26,6 +26,7 @@ const kindFilter = ref('')
 const bulkStatus = ref('')
 const selected = ref([])
 const loading = ref(false)
+let loadRequest = 0
 // The pool can contain multiple email providers. These values drive the Provider column and filter.
 const providers = ref([])
 const byKind = ref({})
@@ -53,6 +54,7 @@ async function loadProviders() {
 
 async function load(resetPage) {
   if (resetPage) page.value = 1
+  const request = ++loadRequest
   loading.value = true
   try {
     const { items, total: t, by_kind } = await listAccounts({
@@ -61,13 +63,15 @@ async function load(resetPage) {
       limit: PAGE_SIZE,
       offset: (page.value - 1) * PAGE_SIZE,
     })
+    if (request !== loadRequest) return
     rows.value = items
     total.value = t
     byKind.value = by_kind || {}
   } catch (e) {
+    if (request !== loadRequest) return
     ElMessage.error(e.message)
   } finally {
-    loading.value = false
+    if (request === loadRequest) loading.value = false
   }
 }
 

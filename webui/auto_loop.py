@@ -15,6 +15,7 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
@@ -75,6 +76,9 @@ class AutoLoopController:
         self._last_break_reason = ""
         # SSE subscribers.
         self._subscribers: list[queue.Queue] = []
+        # Bounded replay lets a freshly loaded or reconnecting browser recover
+        # recent logs for workers that are still active.
+        self._run_event_history: deque[dict] = deque(maxlen=2000)
         # Proxy pool and concurrency.
         self._proxy_pool: list[str] = []
         self._concurrency: int = 1
@@ -96,6 +100,7 @@ class AutoLoopController:
             self._registered_ok = 0
             self._registered_fail = 0
             self._worker_status.clear()
+            self._run_event_history.clear()
             self._consecutive_network_fails = 0
             self._last_message = "Auto-loop started"
             # Parse concurrency settings.
@@ -152,19 +157,41 @@ class AutoLoopController:
         return self._snapshot()
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=100)
+        q: queue.Queue = queue.Queue(maxsize=2500)
         with self._lock:
             self._subscribers.append(q)
-        try:
-            q.put_nowait({"kind": "state", "data": self._snapshot()})
-        except queue.Full:
-            pass
+            active_run_ids = {
+                str(info.get("run_id") or "")
+                for info in self._worker_status.values()
+                if info.get("run_id")
+            }
+            replay = [
+                item for item in self._run_event_history
+                if str(item.get("data", {}).get("run_id") or "") in active_run_ids
+            ]
+            try:
+                q.put_nowait({"kind": "state", "data": self._snapshot()})
+                for item in replay:
+                    q.put_nowait(item)
+            except queue.Full:
+                pass
         return q
 
     def unsubscribe(self, q: queue.Queue):
         with self._lock:
             try: self._subscribers.remove(q)
             except ValueError: pass
+
+    def _publish_run_event(self, run_id: str, event: str, data: dict):
+        """Multiplex one worker's log/status event onto auto subscribers."""
+        packet = {
+            "run_id": run_id,
+            "event": event,
+            "data": data,
+        }
+        with self._lock:
+            self._run_event_history.append({"kind": "run_event", "data": packet})
+        self._broadcast("run_event", packet)
 
     # -------------------------------- Internals --------------------------------
 
@@ -382,7 +409,11 @@ class AutoLoopController:
 
             # Start one run.
             try:
-                run_id = registrar.start_registration(account, run_options)
+                run_id = registrar.start_registration(
+                    account,
+                    run_options,
+                    event_sink=self._publish_run_event,
+                )
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] Failed to start registration: {e}")
                 if pooled:

@@ -10,14 +10,23 @@ import StatusDot from '@/components/StatusDot.vue'
 const { dataVersion } = storeToRefs(useRuntimeStore())
 const rows = ref([])
 const loading = ref(false)
+let loadRequest = 0
 
 const STATUS_TYPE = { done: 'primary', failed: 'danger', running: 'warning' }
 
 async function load() {
+  const request = ++loadRequest
   loading.value = true
-  try { const { items } = await listRuns(50); rows.value = items }
-  catch (e) { ElMessage.error(e.message) }
-  finally { loading.value = false }
+  try {
+    const { items } = await listRuns(50)
+    if (request !== loadRequest) return
+    rows.value = items
+  }
+  catch (e) {
+    if (request !== loadRequest) return
+    ElMessage.error(e.message)
+  }
+  finally { if (request === loadRequest) loading.value = false }
 }
 
 watch(dataVersion, () => load())
