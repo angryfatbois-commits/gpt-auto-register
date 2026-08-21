@@ -18,6 +18,7 @@ class FakeSession:
         self.responses = responses
         self.calls = []
         self.closed = False
+        self.isolated_posts = 0
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
@@ -29,6 +30,10 @@ class FakeSession:
         if url.endswith("/payments/checkout/taxes"):
             return FakeResponse({"ok": True})
         return self.responses.pop(0)
+
+    def post_isolated(self, url, **kwargs):
+        self.isolated_posts += 1
+        return self.post(url, **kwargs)
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
@@ -336,6 +341,9 @@ class GCashNetworkProbeTests(unittest.TestCase):
 
         result = probe_gcash(
             "access-token",
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; session=stored",
             proxy="http://ph-proxy.example:8080",
             session_factory=factory,
         )
@@ -344,16 +352,56 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertTrue(result["method_available"])
         self.assertEqual(
             [item["impersonate"] for item in factories[:2]],
-            ["chrome110", "firefox144"],
+            ["chrome146", "chrome146"],
         )
         self.assertEqual(
             [item["proxy"] for item in factories[:2]],
             ["http://ph-proxy.example:8080", "http://ph-proxy.example:8080"],
         )
         self.assertTrue(rejected_checkout.closed)
+        self.assertEqual(rejected_checkout.isolated_posts, 1)
+        self.assertGreaterEqual(recovered_checkout.isolated_posts, 1)
+        initial_headers = rejected_checkout.calls[0][2]["headers"]
         retry_payload = recovered_checkout.calls[0][2]["json"]
         retry_headers = recovered_checkout.calls[0][2]["headers"]
-        self.assertIn("Firefox/144.0", retry_headers["User-Agent"])
+        for headers in (initial_headers, retry_headers):
+            self.assertIn("Chrome/146.0.0.0", headers["User-Agent"])
+            self.assertIn('"146"', headers["sec-ch-ua"])
+            self.assertEqual(headers["sec-ch-ua-mobile"], "?0")
+            self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
+            self.assertEqual(headers["Accept-Language"], "en-US,en;q=0.9")
+            self.assertEqual(headers["oai-language"], "en-US")
+            self.assertEqual(headers["sec-fetch-dest"], "empty")
+            self.assertEqual(headers["sec-fetch-mode"], "cors")
+            self.assertEqual(headers["sec-fetch-site"], "same-origin")
+            self.assertEqual(headers["OAI-Device-Id"], "device-stable")
+            self.assertEqual(headers["ChatGPT-Account-Id"], "account-stable")
+            self.assertEqual(
+                headers["Cookie"],
+                "oai-did=device-stable; session=stored",
+            )
+            self.assertTrue(headers["oai-client-version"])
+            self.assertTrue(headers["oai-client-build-number"])
+        self.assertEqual(
+            initial_headers["oai-session-id"],
+            retry_headers["oai-session-id"],
+        )
+        self.assertEqual(
+            initial_headers["oai-client-version"],
+            retry_headers["oai-client-version"],
+        )
+        self.assertEqual(
+            initial_headers["oai-client-build-number"],
+            retry_headers["oai-client-build-number"],
+        )
+        chatgpt_session_id = initial_headers["oai-session-id"]
+        for _, url, kwargs in recovered_checkout.calls:
+            if url.startswith("https://chatgpt.com/"):
+                headers = kwargs["headers"]
+                self.assertEqual(headers["oai-session-id"], chatgpt_session_id)
+                self.assertEqual(headers["OAI-Device-Id"], "device-stable")
+                self.assertIn("Chrome/146.0.0.0", headers["User-Agent"])
+        self.assertNotIn(chatgpt_session_id, repr(result))
         self.assertEqual(
             retry_payload["billing_details"],
             {"country": "PH", "currency": "PHP"},
@@ -603,7 +651,7 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(result["classification"], "eligible")
         self.assertEqual(
             [item["impersonate"] for item in factories],
-            ["chrome110", "firefox144"],
+            ["chrome146", "firefox144"],
         )
         self.assertTrue(stripe_session.closed)
         self.assertTrue(chatgpt_session.closed)
@@ -683,7 +731,7 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(result["classification"], "eligible")
         self.assertEqual(
             [item["impersonate"] for item in factories],
-            ["chrome110", "firefox144", "chrome110"],
+            ["chrome146", "firefox144", "chrome110"],
         )
         self.assertEqual(result["custom_method_probe_status"], "accepted")
 
