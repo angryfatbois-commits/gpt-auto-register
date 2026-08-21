@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
@@ -367,6 +367,7 @@ async function saveEdit() {
 
 watch(page, () => load())
 watch(dataVersion, () => load())
+onMounted(() => load())
 onActivated(() => load())
 </script>
 <template>

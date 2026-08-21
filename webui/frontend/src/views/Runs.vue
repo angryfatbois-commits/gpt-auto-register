@@ -1,5 +1,5 @@
 <script setup>
-import { onActivated, ref, watch } from 'vue'
+import { onActivated, onMounted, ref, watch } from 'vue'
 import { storeToRefs } from 'pinia'
 import { ElMessage } from 'element-plus'
 import { listRuns } from '@/api/register'
@@ -30,6 +30,7 @@ async function load() {
 }
 
 watch(dataVersion, () => load())
+onMounted(() => load())
 onActivated(() => load())
 </script>
 

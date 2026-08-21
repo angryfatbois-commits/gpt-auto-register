@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onActivated, ref, watch } from 'vue'
+import { computed, onActivated, onMounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { ElMessage, ElMessageBox } from 'element-plus'
@@ -134,6 +134,7 @@ async function deleteOne(email) {
 
 watch(page, () => load())
 watch(dataVersion, () => load())
+onMounted(() => load())
 onActivated(() => load())
 loadProviders()
 </script>
