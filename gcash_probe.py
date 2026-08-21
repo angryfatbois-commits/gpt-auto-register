@@ -633,6 +633,44 @@ def _stripe_headers(publishable_key: str) -> dict[str, str]:
     }
 
 
+def _safe_rejection_code(stage: str, body: Any) -> str:
+    """Map known upstream rejections to stable codes without retaining text."""
+    if not isinstance(body, Mapping):
+        return ""
+    fragments: list[str] = []
+    for key in ("code", "error_code", "detail", "message", "error"):
+        value = body.get(key)
+        if isinstance(value, Mapping):
+            for nested_key in ("code", "detail", "message", "type"):
+                nested = value.get(nested_key)
+                if isinstance(nested, str):
+                    fragments.append(nested)
+        elif isinstance(value, str):
+            fragments.append(value)
+    text = " ".join(fragments).strip().lower()[:2048]
+    if not text:
+        return ""
+    if "billing country" in text and "request country" in text:
+        return f"{stage}_billing_country_mismatch"
+    if "already paid" in text or "already subscribed" in text:
+        return f"{stage}_already_paid"
+    if (
+        "invalid account" in text
+        or "account not found" in text
+        or ("account context" in text and "invalid" in text)
+    ):
+        return f"{stage}_account_invalid"
+    if "checkout session" in text and (
+        "invalid" in text or "expired" in text or "not found" in text
+    ):
+        return f"{stage}_session_invalid"
+    if "invalid access token" in text or "unauthorized" in text:
+        return f"{stage}_auth_invalid"
+    if "promotion" in text and ("invalid" in text or "rejected" in text):
+        return f"{stage}_promotion_rejected"
+    return ""
+
+
 def _json_response(response: Any, stage: str) -> Mapping[str, Any]:
     status_code = int(getattr(response, "status_code", 0) or 0)
     if not 200 <= status_code < 300:
@@ -645,9 +683,7 @@ def _json_response(response: Any, stage: str) -> Mapping[str, Any]:
                 body = response.json()
             except Exception:
                 body = None
-            detail = str(body.get("detail") or "").lower() if isinstance(body, Mapping) else ""
-            if "billing country" in detail and "request country" in detail:
-                code = f"{stage}_billing_country_mismatch"
+            code = _safe_rejection_code(stage, body) or code
         raise _ProbeFailure(code, retryable=retryable, status_code=status_code)
     try:
         payload = response.json()
