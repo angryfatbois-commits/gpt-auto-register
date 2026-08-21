@@ -36,7 +36,11 @@ from eligibility import (  # noqa: E402
     plus_probe_error,
     redact_sensitive_text,
 )
-from gcash_probe import gcash_probe_error, probe_gcash  # noqa: E402
+from gcash_probe import (  # noqa: E402
+    gcash_probe_error,
+    normalize_gcash_result,
+    probe_gcash,
+)
 from mail_providers import (  # noqa: E402
     ImportValidationError,
     MailProviderError,
@@ -874,7 +878,7 @@ class CheckGCashReq(BaseModel):
         ..., min_length=1, max_length=50, description="Registered accounts to probe"
     )
     proxy: str = Field(
-        "", max_length=2048, description="Proxy used for every probe stage"
+        "", max_length=2048, description="Proxy used for checkout and capability reads"
     )
 
 
@@ -1104,7 +1108,7 @@ def api_check_plus(req: CheckPlusReq):
 
 @app.post("/api/registered/check_gcash")
 def api_check_gcash(req: CheckGCashReq, request: Request):
-    """Explicitly probe GCash eligibility without confirming or starting payment."""
+    """Check whether GCash is exposed, without confirming or starting payment."""
     _require_local_confirmed_gcash_request(request)
     emails = list(dict.fromkeys(
         str(email or "").strip().lower() for email in req.emails
@@ -1119,7 +1123,7 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         raise HTTPException(400, "Proxy URL is too long")
 
     results: dict[str, dict] = {}
-    summary = {"eligible": 0, "ineligible": 0, "unknown": 0}
+    summary = {"eligible": 0, "ineligible": 0}
     for email in emails:
         credential = db.get_registered(email)
         if not credential:
@@ -1128,7 +1132,7 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
                 status="not_found", label="Not found",
             )
             results[email] = result
-            summary["unknown"] += 1
+            summary["ineligible"] += 1
             continue
         access_token = str(credential.get("access_token") or "").strip()
         if not access_token:
@@ -1137,7 +1141,8 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
                 status="no_at", label="No access token",
             )
             results[email] = result
-            summary["unknown"] += 1
+            db.update_eligibility_check(email, "gcash_check", result)
+            summary["ineligible"] += 1
             continue
 
         claims = _get_auth(_decode_jwt_payload(access_token))
@@ -1148,23 +1153,24 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
             uuid.uuid5(uuid.NAMESPACE_DNS, f"gpt-auto-register-gcash:{email}")
         )
         try:
-            result = probe_gcash(
+            result = normalize_gcash_result(probe_gcash(
                 access_token=access_token,
                 account_id=account_id,
                 device_id=device_id,
                 cookie_header=str(credential.get("cookie_header") or ""),
                 proxy=proxy,
-            )
+                checkout_email=email,
+            ))
         except Exception:
             logger.warning("[gcash_check] unexpected probe failure for %s", email)
             result = gcash_probe_error(
                 "probe_unexpected_error", retryable=True,
-                status="unknown", label="GCash status unknown",
+                status="error",
             )
         results[email] = result
         db.update_eligibility_check(email, "gcash_check", result)
-        classification = str(result.get("classification") or "unknown")
-        summary[classification if classification in summary else "unknown"] += 1
+        classification = str(result.get("classification") or "ineligible")
+        summary["eligible" if classification == "eligible" else "ineligible"] += 1
 
     return {"ok": True, "results": results, "summary": summary}
 

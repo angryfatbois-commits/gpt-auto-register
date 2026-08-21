@@ -12,7 +12,7 @@ import { useFormStore, proxyText } from '@/stores/form'
 import { useProxyStore } from '@/stores/proxy'
 import { useRuntimeStore } from '@/stores/runtime'
 import StatusDot from '@/components/StatusDot.vue'
-import { formatGCashDetail, gcashStatusType, summarizeGCash } from '@/eligibility'
+import { formatGCashDetail, gcashDisplayLabel, gcashStatusType, summarizeGCash } from '@/eligibility'
 
 const { form } = storeToRefs(useFormStore())
 // Eligibility checks must use the proxy-pool selection. A stale localStorage
@@ -98,14 +98,15 @@ async function doGCashCheck() {
   const emails = selected.value.map((row) => row.email)
   if (!emails.length) { ElMessage.info('Select at least one account'); return }
   const approved = await confirm(
-    `Probe GCash eligibility for ${emails.length} selected account(s)?\n\n` +
-    'This creates and updates a checkout, calculates taxes, and inspects capability metadata.\n' +
+    `Check GCash availability for ${emails.length} selected account(s)?\n\n` +
+    'This creates a PH/PHP checkout, applies the Plus campaign, synchronizes taxes, and reads payment-method capability metadata.\n' +
+    'A Philippines proxy is required because the checkout billing country is PH.\n' +
     'It never confirms the checkout, starts a custom payment method, or executes payment.',
   )
   if (!approved) return
 
   gcashChecking.value = true
-  gcashResult.value = `Checking GCash eligibility... (${emails.length})`
+  gcashResult.value = `Checking GCash availability... (${emails.length})`
   try {
     const { results } = await checkGCash(emails, proxyText(form.value))
     for (const [email, info] of Object.entries(results || {})) {
@@ -381,11 +382,12 @@ onActivated(() => load())
         </el-select>
         <el-select
           v-model="form.proxy" filterable clearable allow-create default-first-option
-          :reserve-keyword="false" placeholder="Check proxy (blank for direct)"
+          :reserve-keyword="false" placeholder="Check proxy (use a PH exit for GCash)"
           style="width: 260px"
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
+        <span class="hint">GCash uses a PH/PHP checkout; select a Philippines proxy to match it.</span>
         <el-button :loading="checking" @click="doCheck('unchecked')">Check unchecked</el-button>
         <el-button :loading="checking" @click="doCheck('all')">Recheck page</el-button>
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">
@@ -462,7 +464,7 @@ onActivated(() => load())
             <span v-else class="hint">—</span>
           </template>
         </el-table-column>
-        <el-table-column label="GCash eligibility" width="170">
+        <el-table-column label="GCash availability" width="170">
           <template #default="{ row }">
             <el-tooltip
               v-if="gcashOf(row)"
@@ -472,7 +474,7 @@ onActivated(() => load())
               <span>
                 <StatusDot
                   :type="gcashStatusType(gcashOf(row).classification)"
-                  :text="gcashOf(row).label"
+                  :text="gcashDisplayLabel(gcashOf(row))"
                 />
               </span>
             </el-tooltip>

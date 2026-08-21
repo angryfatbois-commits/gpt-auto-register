@@ -116,12 +116,14 @@ class GCashEligibilityApiTests(unittest.TestCase):
             "cookie_header": "session=cookie",
         }
         probe_result = {
+            "operation": "gcash_payment_eligibility",
+            "check_scope": "payment_method_only",
             "classification": "eligible",
             "eligible": True,
             "conclusive": True,
-            "decision": "gcash_zero_due_available",
+            "decision": "gcash_available",
             "status": "eligible",
-            "label": "GCash eligible",
+            "label": "GCash available",
         }
 
         with patch("webui.app.db.get_registered", return_value=credential) as get_registered, \
@@ -141,9 +143,10 @@ class GCashEligibilityApiTests(unittest.TestCase):
         get_registered.assert_called_once_with("person@example.com")
         self.assertEqual(probe.call_args.kwargs["proxy"], "http://proxy.example:8080")
         self.assertEqual(probe.call_args.kwargs["access_token"], "access-token")
+        self.assertEqual(probe.call_args.kwargs["checkout_email"], "person@example.com")
         persist.assert_called_once_with("person@example.com", "gcash_check", probe_result)
 
-    def test_missing_access_token_does_not_call_or_persist_probe(self):
+    def test_missing_access_token_is_unavailable_without_calling_probe(self):
         with patch("webui.app.db.get_registered", return_value={"email": "person@example.com"}), \
              patch("webui.app.probe_gcash") as probe, \
              patch("webui.app.db.update_eligibility_check") as persist:
@@ -153,9 +156,13 @@ class GCashEligibilityApiTests(unittest.TestCase):
 
         result = response["results"]["person@example.com"]
         self.assertEqual(result["status"], "no_at")
-        self.assertEqual(result["classification"], "unknown")
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertEqual(result["label"], "GCash unavailable")
         probe.assert_not_called()
-        persist.assert_not_called()
+        persist.assert_called_once_with(
+            "person@example.com", "gcash_check", result
+        )
 
     def test_batch_size_is_bounded(self):
         with self.assertRaises(ValidationError):
@@ -192,10 +199,12 @@ class GCashEligibilityApiTests(unittest.TestCase):
             )
 
         first = response["results"]["one@example.com"]
-        self.assertEqual(first["classification"], "unknown")
+        self.assertEqual(first["classification"], "ineligible")
+        self.assertEqual(first["label"], "GCash unavailable")
         self.assertEqual(first["decision"], "probe_unexpected_error")
         self.assertNotIn("sensitive upstream detail", repr(first))
         self.assertEqual(response["results"]["two@example.com"]["classification"], "ineligible")
+        self.assertEqual(response["summary"], {"eligible": 0, "ineligible": 2})
 
     def test_requires_explicit_checkout_side_effect_acknowledgement(self):
         with patch("webui.app.db.get_registered") as get_registered, \

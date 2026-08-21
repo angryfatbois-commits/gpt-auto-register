@@ -28,6 +28,8 @@ _ROOT = Path(__file__).resolve().parents[1]
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+from gcash_probe import normalize_gcash_result
+
 DB_PATH = Path(__file__).resolve().parent / "webui.db"
 
 _lock = threading.Lock()  # Serialize SQLite writes.
@@ -704,7 +706,9 @@ _SAFE_ELIGIBILITY_FIELDS = frozenset({
     "subscription_plan", "has_active_subscription", "campaign_id",
     "campaign_title", "discount_percentage", "duration_periods",
     "duration_unit", "method_available", "custom_method_id_discovered",
-    "amount_minor", "currency",
+    "amount_minor", "currency", "checkout_country", "check_scope", "method_evidence_present",
+    "trusted_custom_method_matched", "custom_method_probe_status",
+    "custom_method_probe_failure", "custom_method_probe_exception",
 })
 
 
@@ -718,12 +722,26 @@ def _safe_eligibility_result(value: dict) -> dict:
     }
 
 
+def _normalize_extra_gcash(extra: object) -> object:
+    """Normalize a stored GCash result on every read surface."""
+    if not isinstance(extra, dict):
+        return extra
+    gcash = extra.get("gcash_check")
+    if not isinstance(gcash, dict):
+        return extra
+    normalized = dict(extra)
+    normalized["gcash_check"] = normalize_gcash_result(gcash)
+    return normalized
+
+
 def update_eligibility_check(email: str, key: str, result: dict) -> None:
     """Persist a sanitized eligibility result while retaining the last verdict."""
     if key not in _ELIGIBILITY_KEYS:
         raise ValueError("unsupported eligibility result key")
     email = email.strip().lower()
     safe = _safe_eligibility_result(result)
+    if key == "gcash_check":
+        safe = _safe_eligibility_result(normalize_gcash_result(safe))
     with _lock:
         con = _conn()
         try:
@@ -808,9 +826,11 @@ def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") ->
         gcash = None
         if d.get("extra_json"):
             try:
-                extra = json.loads(d["extra_json"])
+                extra = _normalize_extra_gcash(json.loads(d["extra_json"]))
                 plus = extra.get("plus_check")
                 gcash = extra.get("gcash_check")
+                if isinstance(gcash, dict):
+                    gcash = normalize_gcash_result(gcash)
             except Exception:
                 pass
         d["plus_check"] = plus
@@ -839,7 +859,7 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
         d = dict(row)
         if d.get("extra_json"):
             try:
-                d["extra"] = json.loads(d["extra_json"])
+                d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
             except Exception:
                 d["extra"] = {}
         d.pop("extra_json", None)
@@ -873,7 +893,7 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
             d = dict(row)
             if d.get("extra_json"):
                 try:
-                    d["extra"] = json.loads(d["extra_json"])
+                    d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
                 except Exception:
                     d["extra"] = {}
             d.pop("extra_json", None)
@@ -885,18 +905,21 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
 
 def get_registered(email: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
-    row = cur.fetchone()
-    if not row:
-        return None
-    out = dict(row)
-    if out.get("extra_json"):
-        try:
-            out["extra"] = json.loads(out["extra_json"])
-        except Exception:
-            out["extra"] = {}
-    out.pop("extra_json", None)
-    return out
+    try:
+        cur = con.execute("SELECT * FROM registered WHERE email=?", (email.lower(),))
+        row = cur.fetchone()
+        if not row:
+            return None
+        out = dict(row)
+        if out.get("extra_json"):
+            try:
+                out["extra"] = _normalize_extra_gcash(json.loads(out["extra_json"]))
+            except Exception:
+                out["extra"] = {}
+        out.pop("extra_json", None)
+        return out
+    finally:
+        con.close()
 
 
 def delete_registered(email: str) -> bool:
