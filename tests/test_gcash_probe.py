@@ -240,11 +240,11 @@ class GCashClassificationTests(unittest.TestCase):
         result = classify_gcash_evidence(
             [{
                 "custom_payment_method_data": [{
-                    "type": "cpmt_configured_gcash",
+                    "type": "cpmt_configured_one",
                     "display_name": "Localized wallet label",
                 }],
             }],
-            trusted_custom_method_ids=["cpmt_configured_gcash"],
+            trusted_custom_method_ids=["cpmt_configured_one"],
         )
 
         self.assertEqual(result["classification"], "eligible")

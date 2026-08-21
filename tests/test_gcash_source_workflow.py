@@ -124,7 +124,10 @@ class GCashSourceWorkflowTests(unittest.TestCase):
             _Response({"payment_method_types": ["card", "custom_payment_method"]}),
             _Response({
                 "custom_payment_method_data": [
-                    {"id": "cpmt_configured_source_workflow", "display_name": "GCash"}
+                    {
+                        "type": "cpmt_configured_source_workflow",
+                        "display_name": "Localized wallet label",
+                    }
                 ]
             }),
         ])
@@ -140,6 +143,7 @@ class GCashSourceWorkflowTests(unittest.TestCase):
             )
 
         self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["trusted_custom_method_matched"])
         self.assertEqual(session.calls[-1][1], "https://api.stripe.com/v1/elements/sessions")
         self.assertEqual(
             session.calls[-1][2]["params"]["custom_payment_methods[0]"],
