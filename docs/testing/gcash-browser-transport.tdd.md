@@ -57,3 +57,5 @@ once from the WebUI to validate the upstream behavior.
 - Diagnostic GREEN checkpoint: `c56f9f3` (`fix: classify safe gcash checkout rejection reasons`)
 - Promotion-retry RED checkpoint: `35723ad` (`test: preserve minimal retry for rejected promotion`)
 - Promotion-retry GREEN checkpoint: `8012268` (`fix: retry checkout without rejected promotion`)
+- Client-hints RED checkpoint: `daaf5db` (`test: require complete chrome client hints`)
+- Client-hints GREEN checkpoint: `6ffcad3` (`fix: complete gcash chrome client hints`)
