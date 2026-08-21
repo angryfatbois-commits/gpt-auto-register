@@ -879,6 +879,32 @@ class GCashNetworkProbeTests(unittest.TestCase):
                 self.assertEqual(result["decision"], expected)
                 self.assertNotIn(detail, repr(result))
 
+    def test_checkout_promotion_rejection_still_uses_minimal_retry(self):
+        rich_checkout = FakeSession([
+            FakeResponse({"detail": "Invalid promotion"}, status_code=400),
+        ])
+        minimal_checkout = FakeSession([
+            FakeResponse({"checkout_session_id": "invalid"}),
+        ])
+        sessions = [rich_checkout, minimal_checkout]
+        factories = []
+
+        def factory(**kwargs):
+            factories.append(kwargs)
+            return sessions.pop(0)
+
+        result = probe_gcash(
+            "access-token",
+            proxy="http://ph-proxy.example:8080",
+            session_factory=factory,
+        )
+
+        self.assertEqual(result["decision"], "checkout_session_missing")
+        self.assertEqual(len(factories), 2)
+        retry_payload = minimal_checkout.calls[0][2]["json"]
+        self.assertNotIn("promo_campaign", retry_payload)
+        self.assertNotIn("check_card_proxy", retry_payload)
+
     def test_explicit_checkout_evidence_survives_resolve_failure(self):
         checkout = {
             "checkout_session_id": "cs_test_resolve_failure",
