@@ -44,7 +44,7 @@ npm run build (webui/frontend)
 1711 modules transformed; production build succeeded
 
 node --test --experimental-test-coverage tests/realtime-sync.test.mjs
-9 tests passed; 100.00% line, branch, and function coverage for the harness
+9 tests passed; the runner emitted no instrumented production-source rows
 
 npm audit --audit-level=high
 found 0 vulnerabilities
@@ -83,12 +83,14 @@ No broken requirements found.
 
 ## Coverage and known gaps
 
-The Node built-in coverage run reports 100% for the focused realtime harness.
-The repository does not include Python `coverage.py`, so a numeric backend
-coverage percentage was not claimed. Backend behavior is covered by the full
-86-test unittest suite. Browser QA used synthetic local data only; no real
-ChatGPT registration, mailbox credential, OTP, payment, or production account
-was exercised.
+The runtime-store tests load controlled source through an in-memory harness;
+Node's built-in coverage runner did not attribute those executed lines to a
+production file. The repository also does not include Python `coverage.py`.
+Therefore no numeric coverage percentage is claimed. Behavior is covered by
+the focused frontend/backend regression tests, the full 28-test frontend and
+86-test backend suites, and isolated browser QA. Browser QA used synthetic
+local data only; no real ChatGPT registration, mailbox credential, OTP,
+payment, or production account was exercised.
 
 ## Merge evidence
 
