@@ -399,6 +399,18 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
                     method_present = method_present or found
                     custom_ids.extend(ids)
                     method_tokens.extend(tokens)
+                    # Some checkout/Elements responses expose the opaque
+                    # custom-method ID as a scalar field (for example
+                    # ``custom_payment_method_type_id``) instead of placing
+                    # it in ``custom_payment_methods``. Treat that ID as the
+                    # same GCash capability candidate, while preserving an
+                    # explicit non-GCash label on an object as a negative
+                    # override.
+                    if ids:
+                        if _has_non_gcash_label(value):
+                            custom_non_gcash_present = True
+                        else:
+                            custom_candidate_present = True
 
                 if key_text in {"currency", "currency_code"} and isinstance(value, str):
                     currency = value.strip().upper()
