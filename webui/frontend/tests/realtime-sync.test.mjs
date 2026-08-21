@@ -148,6 +148,25 @@ test('a reconnect keeps active-worker state without opening per-run connections'
 })
 
 
+test('a multiplexed completion immediately invalidates registered data', async () => {
+  const { store, connections, statsStore } = await loadRuntimeHarness()
+  store.connectAutoStream()
+  const automatic = connections[0]
+
+  automatic.handlers.run_event(message({
+    run_id: 'completed-run',
+    event: 'status',
+    data: {
+      kind: 'done', email: 'done@example.com', password: 'generated-password',
+      access_token_len: 12, partial: false,
+    },
+  }))
+
+  assert.equal(statsStore.refreshCalls, 1)
+  assert.equal(store.dataVersion.value, 1)
+})
+
+
 test('an automatic run stream error performs a final data reconciliation', async () => {
   const { store, connections, statsStore } = await loadRuntimeHarness()
   const run = store.streamRun('run-error')
@@ -191,5 +210,15 @@ test('cached pool, registered-account, and run views subscribe to data invalidat
     const view = await readFile(new URL(`../src/views/${name}`, import.meta.url), 'utf8')
     assert.match(view, /watch\(dataVersion,\s*\(\)\s*=>\s*load\(\)\)/, name)
     assert.match(view, /onActivated\(\(\)\s*=>\s*load\(\)\)/, name)
+  }
+})
+
+
+test('realtime tables discard stale overlapping list responses', async () => {
+  for (const name of ['Pool.vue', 'Registered.vue', 'Runs.vue']) {
+    const view = await readFile(new URL(`../src/views/${name}`, import.meta.url), 'utf8')
+    assert.match(view, /let loadRequest = 0/, name)
+    assert.match(view, /const request = \+\+loadRequest/, name)
+    assert.match(view, /if \(request !== loadRequest\) return/, name)
   }
 })
