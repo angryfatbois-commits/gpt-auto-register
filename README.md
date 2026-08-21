@@ -148,7 +148,9 @@ clean-room and bounded to payment-capability stages:
 5. Ask Stripe Payment Pages or Stripe Elements for capability metadata. A live
    `cpmt_...` ID returned by Checkout is preferred; an ID may be supplied
    explicitly through `GCASH_CUSTOM_PAYMENT_METHOD_ID` when the upstream only
-   returns an opaque custom-method slot.
+   returns an opaque custom-method slot. When Elements is queried, an opaque
+   method is accepted only when the same ID is returned for the PH/PHP session;
+   a localized or merchant-defined display label is not required.
 
 The probe stops before checkout confirmation, custom-payment start, provider
 redirect, or payment execution. It never submits a GCash account or authorizes
@@ -160,8 +162,9 @@ source commit, clean-room boundary, endpoint map, and excluded payment stages.
 
 The decision depends only on payment-method evidence:
 
-- an explicit GCash method or a live opaque `cpmt_...` custom-method entry is
-  present -> `eligible` (`GCash available`);
+- an explicit GCash method is present -> `eligible` (`GCash available`);
+- a live opaque `cpmt_...` entry makes an exact PH/PHP round trip through Stripe
+  Elements -> `eligible` (`GCash available`);
 - an explicit method list without GCash is present -> `ineligible`
   (`GCash unavailable`);
 - a successful checkout has no usable method list -> `ineligible` with the
@@ -169,16 +172,20 @@ The decision depends only on payment-method evidence:
 - a rejected or incomplete checkout response -> `ineligible` with a stable
   `checkout_*` or `gcash_evidence_incomplete` decision.
 
-Amount and currency values are retained only as diagnostics. Zero, positive,
-negative, missing, conflicting, PHP, and non-PHP values do not change the
-GCash availability result once method evidence is present.
+Amount values are retained only as diagnostics. Zero and positive amounts do not
+change availability. The capability request itself remains restricted to the
+PH/PHP checkout contract; an explicit non-PH/PHP response is not trusted for an
+opaque custom-method match.
 
 The WebUI deliberately exposes only two account outcomes: `GCash available` or
 `GCash unavailable`. Missing credentials, authentication failures, malformed
 responses, and transport failures are also normalized to `GCash unavailable`
 because the requested contract has no third `unknown` state. Their stable
-`decision`, `status`, and `retryable` fields remain available in the detail
-view/logs so an operator can distinguish “not present” from “could not read”.
+`decision`, `status`, `retryable`, and (when applicable)
+`custom_method_probe_status`/`custom_method_probe_failure` fields remain
+available in the detail view/logs so an operator can distinguish “not present”
+from “could not read”. These diagnostics contain stage codes only, never raw
+Stripe responses or credentials.
 For a real PH GCash check, use a working Philippines proxy; a direct/US exit
 will normally return the US method set and therefore `GCash unavailable`.
 If a deployment needs to supply a known opaque custom-method ID for the
@@ -196,7 +203,9 @@ proxy-aware result and preserves its technical decision code.
 The selected proxy is used consistently for checkout, promotion update, tax
 sync, and capability reads. GCash uses the explicit PH/PHP checkout contract,
 so the proxy must exit in the Philippines; a failed or mismatched proxy request
-does not silently fall back to a direct connection. Proxy credentials, access
+does not silently fall back to a direct connection. Stripe Elements capability
+reads use an isolated browser session with a matching fingerprint/User-Agent and
+one bounded retry on transport-only failures. Proxy credentials, access
 tokens, cookies, checkout session IDs, customer secrets, and raw upstream
 bodies are excluded from stored eligibility results.
 

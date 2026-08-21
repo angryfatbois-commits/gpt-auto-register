@@ -75,6 +75,29 @@ test('availability detail shows the inferred checkout region when present', () =
   assert.match(text, /Checkout: US \/ USD/)
 })
 
+test('availability detail exposes only sanitized capability diagnostics', () => {
+  const text = formatGCashDetail(
+    {
+      classification: 'ineligible',
+      decision: 'gcash_unavailable',
+      custom_method_probe_status: 'failed',
+      custom_method_probe_failure: 'stripe_custom_capability_transport_error',
+      custom_method_probe_exception: 'ConnectionError',
+    },
+  )
+
+  assert.match(text, /Capability: failed/)
+  assert.match(text, /Issue: stripe_custom_capability_transport_error/)
+  assert.match(text, /Exception: ConnectionError/)
+  assert.doesNotMatch(text, /Bearer|cookie|secret|cpmt_/i)
+
+  const unsafe = formatGCashDetail({
+    decision: 'gcash_unavailable',
+    custom_method_probe_failure: 'Bearer secret-token',
+  })
+  assert.doesNotMatch(unsafe, /Bearer|secret-token/i)
+})
+
 test('legacy stored labels are presented as availability labels', () => {
   assert.equal(gcashDisplayLabel({ label: 'GCash eligible' }), 'GCash available')
   assert.equal(gcashDisplayLabel({ label: 'GCash ineligible' }), 'GCash unavailable')

@@ -57,13 +57,17 @@ application does not embed the source repository's opaque identifier.
 
 The user-facing result remains binary:
 
-- explicit GCash evidence or a GCash custom-method candidate: `GCash available`;
+- explicit GCash evidence: `GCash available`;
+- a `cpmt_...` candidate returned by Checkout and echoed by Stripe Elements for
+  the same PH/PHP session: `GCash available`, even when the display label is
+  localized or merchant-defined;
 - explicit method evidence without GCash, missing evidence, authentication
   failure, or transport failure: `GCash unavailable`.
 
-Amount and currency are retained for diagnostics and do not override method
-availability, matching the requested policy. Technical `decision`, `status`,
-and `retryable` fields remain available for troubleshooting.
+Amount is retained for diagnostics and does not override method availability.
+The probe requires the explicit PH/PHP contract for opaque custom-method
+matching. Technical `decision`, `status`, `retryable`, and redacted custom
+capability stage codes remain available for troubleshooting.
 
 The probe never calls checkout confirmation, custom-payment start, provider
 redirect, or any payment execution endpoint. The WebUI's existing explicit

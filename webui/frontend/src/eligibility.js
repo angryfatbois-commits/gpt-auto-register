@@ -31,11 +31,24 @@ export function gcashDisplayLabel(check) {
     : 'GCash unavailable'
 }
 
+function diagnosticCode(value) {
+  const text = String(value ?? '').trim()
+  if (/^(?:cpmt_|bearer\b|cookie\b|secret\b)/i.test(text)) return ''
+  return /^[A-Za-z][A-Za-z0-9_.-]{0,119}$/.test(text) ? text : ''
+}
+
 export function formatGCashDetail(check, formatTime = (value) => String(value)) {
   if (!check) return ''
   const parts = []
-  if (check.decision) parts.push(`Decision: ${check.decision}`)
+  const decision = diagnosticCode(check.decision)
+  if (decision) parts.push(`Decision: ${decision}`)
   parts.push(`Method: ${gcashDisplayLabel(check)}`)
+  const probeStatus = diagnosticCode(check.custom_method_probe_status)
+  const probeFailure = diagnosticCode(check.custom_method_probe_failure)
+  const probeException = diagnosticCode(check.custom_method_probe_exception)
+  if (probeStatus) parts.push(`Capability: ${probeStatus}`)
+  if (probeFailure) parts.push(`Issue: ${probeFailure}`)
+  if (probeException) parts.push(`Exception: ${probeException}`)
   if (check.checkout_country || check.currency) {
     parts.push(`Checkout: ${[check.checkout_country, check.currency].filter(Boolean).join(' / ')}`)
   }

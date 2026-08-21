@@ -123,6 +123,9 @@ confirmation/start/payment execution calls.
 | 16 | Element Plus, project-owned UI text, and shipped static assets are English-only | `webui/frontend/tests/english-ui.test.mjs` | Frontend/build regression | PASS |
 | 17 | GCash Checkout uses the explicit PH/PHP contract and reports a mismatched proxy as a billing-country failure | `tests/test_gcash_probe.py`, `tests/test_gcash_source_workflow.py` | Live-regression transport contract | PASS |
 | 18 | The UI explains the PH/PHP checkout, promotion update, tax sync, and Philippines proxy requirement | `webui/frontend/tests/eligibility.test.mjs` | Frontend unit | PASS |
+| 19 | A nonliteral Elements label is accepted only for an exact PH/PHP Checkout-to-Elements custom-method round trip; mismatched regions/IDs remain unavailable | `tests/test_gcash_probe.py` | Network-probe regression | PASS |
+| 20 | Elements capability uses an isolated Stripe session, matching browser fingerprint/UA headers, and transport failures expose only a stable stage code | `tests/test_gcash_probe.py` | Security/transport regression | PASS |
+| 21 | GCash detail tooltips show sanitized capability diagnostics without raw secrets or opaque IDs | `webui/frontend/tests/eligibility.test.mjs` | Frontend security regression | PASS |
 
 ## GREEN evidence
 
@@ -130,7 +133,7 @@ Backend suite:
 
 ```text
 python -m unittest discover -s tests -p "test_*.py" -v
-Ran 62 tests
+Ran 74 tests
 OK
 ```
 
@@ -138,7 +141,7 @@ Frontend suite:
 
 ```text
 npm --prefix webui/frontend test
-tests 11, pass 11, fail 0
+tests 12, pass 12, fail 0
 ```
 
 Production frontend:
@@ -158,8 +161,16 @@ compileall: OK
 python -m pip check
 No broken requirements found.
 
-npm --prefix webui/frontend audit --no-package-lock --audit-level=high
+npm audit --omit=dev --audit-level=high
 found 0 vulnerabilities
+```
+
+Live localhost regression after the Stripe fingerprint/UA fix:
+
+```text
+7 accounts checked; 2 eligible (`accepted`, exact custom-method match),
+5 ineligible (`not_requested`, no GCash/custom method exposed),
+0 Stripe transport failures; all 7 checkout responses were PH/PHP.
 ```
 
 ## Coverage
@@ -177,10 +188,9 @@ Both new backend modules exceed the required 80% line coverage.
 
 ## Known gaps
 
-- Most tests use dependency-injected fake transports. One controlled localhost
-  regression check was run against an authorized saved account to confirm the
-  billing-country mismatch and the fixed binary result; no payment confirmation,
-  custom-payment start, or payment execution endpoint was called.
+- Most tests use dependency-injected fake transports. A controlled localhost
+  regression batch was run against seven authorized saved accounts; no payment
+  confirmation, custom-payment start, or payment execution endpoint was called.
 - GCash availability is regional checkout capability, not proof that a saved
   GCash wallet is attached. Use a working Philippines exit to inspect the PH/PHP
   method set. A direct or non-PH exit can conclusively report GCash unavailable

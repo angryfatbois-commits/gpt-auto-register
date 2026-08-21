@@ -9,6 +9,7 @@ custom-payment start, or any payment execution operation.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 import time
@@ -34,10 +35,22 @@ _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 )
+_STRIPE_USER_AGENTS = {
+    "firefox144": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+        "Gecko/20100101 Firefox/144.0"
+    ),
+    "chrome110": (
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) "
+        "Chrome/110.0.0.0 Safari/537.36"
+    ),
+}
 _STRIPE_VERSION = (
     "2025-03-31.basil; checkout_server_update_beta=v1; "
     "checkout_manual_approval_preview=v1"
 )
+_LOGGER = logging.getLogger("gcash_probe")
 
 _BROWSER_PROFILES = {
     "PH": ("en-PH", "Asia/Manila"),
@@ -101,11 +114,18 @@ class _ProbeFailure(RuntimeError):
         *,
         retryable: bool,
         status_code: int = 0,
+        exception_type: str = "",
     ) -> None:
         super().__init__(code)
         self.code = code
         self.retryable = retryable
         self.status_code = int(status_code or 0)
+        safe_type = str(exception_type or "").strip()
+        self.exception_type = (
+            safe_type
+            if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", safe_type)
+            else ""
+        )
 
 
 def _checked_at(value: float | None) -> float:
@@ -492,6 +512,7 @@ def classify_gcash_evidence(
     require_zero: bool = True,
     checked_at: float | None = None,
     trusted_custom_method_ids: Iterable[str] = (),
+    require_trusted_custom_method_match: bool = False,
 ) -> dict[str, Any]:
     """Return a method-only availability result from checkout evidence.
 
@@ -505,6 +526,16 @@ def classify_gcash_evidence(
         trusted_custom_method_ids=trusted_custom_method_ids,
     )
     method = evidence["method_available"]
+    if (
+        require_trusted_custom_method_match
+        and not evidence["explicit_method_present"]
+        and not evidence["trusted_custom_method_matched"]
+    ):
+        # Once Elements has answered a custom-method capability request, an
+        # opaque checkout candidate must make an exact round trip.  Otherwise
+        # a different wallet returned by Elements could become a false GCash
+        # positive merely because both methods use a ``cpmt_...`` identifier.
+        method = False
     amounts = evidence["amounts"]
     currencies = evidence["currencies"]
     countries = evidence["countries"]
@@ -625,7 +656,11 @@ def _post_json(
             allow_redirects=False,
         )
     except Exception as exc:
-        raise _ProbeFailure(f"{stage}_transport_error", retryable=True) from exc
+        raise _ProbeFailure(
+            f"{stage}_transport_error",
+            retryable=True,
+            exception_type=type(exc).__name__,
+        ) from exc
     return _json_response(response, stage)
 
 
@@ -646,7 +681,11 @@ def _post_form(
             allow_redirects=False,
         )
     except Exception as exc:
-        raise _ProbeFailure(f"{stage}_transport_error", retryable=True) from exc
+        raise _ProbeFailure(
+            f"{stage}_transport_error",
+            retryable=True,
+            exception_type=type(exc).__name__,
+        ) from exc
     return _json_response(response, stage)
 
 
@@ -669,7 +708,11 @@ def _get_json(
             request_kwargs["params"] = dict(params)
         response = session.get(url, **request_kwargs)
     except Exception as exc:
-        raise _ProbeFailure(f"{stage}_transport_error", retryable=True) from exc
+        raise _ProbeFailure(
+            f"{stage}_transport_error",
+            retryable=True,
+            exception_type=type(exc).__name__,
+        ) from exc
     return _json_response(response, stage)
 
 
@@ -954,6 +997,11 @@ def probe_gcash(
     stage = "session"
     optional_failures: list[_ProbeFailure] = []
     trusted_custom_method_matches: list[str] = []
+    custom_method_requires_roundtrip = False
+    custom_capability_status = "not_requested"
+    custom_capability_response_id_count = 0
+    custom_capability_failure_codes: list[str] = []
+    custom_capability_failure_types: list[str] = []
     try:
         session = session_factory(
             proxy=str(proxy or "").strip() or None,
@@ -1066,6 +1114,15 @@ def probe_gcash(
         custom_ids_for_probe = list(dict.fromkeys(
             [*discovered, configured_id] if configured_id else discovered
         ))
+        checkout_evidence = _evidence(payloads)
+        # The request itself is fixed to PH/PHP.  Accept omitted region fields
+        # from an upstream response, but reject an explicit mismatch before
+        # trusting an opaque custom-method ID.
+        ph_php_checkout = (
+            checkout_evidence["countries"] in (set(), {GCASH_CHECKOUT_COUNTRY})
+            and checkout_evidence["currencies"] in (set(), {GCASH_CHECKOUT_CURRENCY})
+        )
+        custom_method_requires_roundtrip = bool(custom_ids_for_probe)
         stripe_context = _stripe_context(payloads)
         # Payment Pages init is the read-only capability source for standard
         # method lists. Custom methods use the Elements endpoint below because
@@ -1092,29 +1149,102 @@ def probe_gcash(
         if custom_ids_for_probe:
             elements_request = _stripe_elements_params(stripe_context, custom_ids_for_probe)
             if elements_request is not None:
+                custom_capability_status = "requested"
                 publishable_key, elements_params = elements_request
                 stage = "stripe_custom_capability"
-                try:
-                    stripe = _get_json(
-                        session,
-                        STRIPE_ELEMENTS_URL,
-                        headers={
-                            "Accept": "application/json",
-                            "Authorization": f"Bearer {publishable_key}",
-                            "Origin": "https://js.stripe.com",
-                            "Referer": "https://js.stripe.com/",
-                            "User-Agent": _USER_AGENT,
-                        },
-                        params=elements_params,
-                        timeout=timeout,
-                        stage=stage,
-                    )
-                    stripe_custom_ids = _evidence([stripe])["custom_method_ids"]
-                    if configured_id and configured_id in stripe_custom_ids:
-                        trusted_custom_method_matches.append(configured_id)
-                    payloads.append(stripe)
-                except _ProbeFailure as exc:
-                    optional_failures.append(exc)
+                # A proxy/TLS path can reject one browser fingerprint. Retry
+                # transport failures once with a fresh session and a second
+                # Stripe fingerprint; HTTP/auth responses are not retried.
+                for attempt_index, stripe_impersonate in enumerate(
+                    ("firefox144", "chrome110")
+                ):
+                    elements_session = None
+                    try:
+                        # Stripe Elements is a separate browser-origin
+                        # capability request. Keep it out of the authenticated
+                        # ChatGPT session so cookies, TLS fingerprints, and
+                        # proxy state do not cross-contaminate the two hosts.
+                        elements_session = session_factory(
+                            proxy=str(proxy or "").strip() or None,
+                            impersonate=stripe_impersonate,
+                        )
+                        stripe = _get_json(
+                            elements_session,
+                            STRIPE_ELEMENTS_URL,
+                            headers={
+                                "Accept": "application/json",
+                                "Authorization": f"Bearer {publishable_key}",
+                                "Origin": "https://js.stripe.com",
+                                "Referer": "https://js.stripe.com/",
+                                "User-Agent": _STRIPE_USER_AGENTS[stripe_impersonate],
+                            },
+                            params=elements_params,
+                            timeout=timeout,
+                            stage=stage,
+                        )
+                        stripe_custom_ids = _evidence([stripe])["custom_method_ids"]
+                        custom_capability_response_id_count = len(stripe_custom_ids)
+                        # Stripe Elements returns the custom-method entries that
+                        # it accepted for this exact customer session. A
+                        # checkout ID that makes the same round trip is stronger
+                        # capability evidence than a merchant-defined/localized
+                        # display label; labels need not contain "GCash".
+                        accepted_ids = (
+                            set(custom_ids_for_probe).intersection(stripe_custom_ids)
+                            if ph_php_checkout
+                            else set()
+                        )
+                        trusted_custom_method_matches.extend(sorted(accepted_ids))
+                        custom_capability_status = (
+                            "accepted" if accepted_ids else "rejected"
+                        )
+                        payloads.append(stripe)
+                        break
+                    except _ProbeFailure as exc:
+                        should_retry = (
+                            exc.code.endswith("_transport_error")
+                            and attempt_index == 0
+                        )
+                        if should_retry:
+                            continue
+                        optional_failures.append(exc)
+                        custom_capability_failure_codes.append(exc.code)
+                        if exc.exception_type:
+                            custom_capability_failure_types.append(exc.exception_type)
+                        custom_capability_status = "failed"
+                        break
+                    except Exception as exc:
+                        failure = _ProbeFailure(
+                            "stripe_custom_capability_transport_error",
+                            retryable=True,
+                            exception_type=type(exc).__name__,
+                        )
+                        if attempt_index == 0:
+                            continue
+                        optional_failures.append(failure)
+                        custom_capability_failure_codes.append(failure.code)
+                        if failure.exception_type:
+                            custom_capability_failure_types.append(failure.exception_type)
+                        custom_capability_status = "failed"
+                        break
+                    finally:
+                        if elements_session is not None and elements_session is not session:
+                            try:
+                                elements_session.close()
+                            except Exception:
+                                pass
+            else:
+                custom_capability_status = "not_configured"
+
+        _LOGGER.info(
+            "[gcash_probe] custom capability status=%s candidates=%d response_ids=%d matches=%d ph_php=%s failures=%s",
+            custom_capability_status,
+            len(custom_ids_for_probe),
+            custom_capability_response_id_count,
+            len(trusted_custom_method_matches),
+            ph_php_checkout,
+            ",".join(custom_capability_failure_codes) or "none",
+        )
 
         evidence = _evidence(payloads)
         if evidence["method_available"] is None and optional_failures:
@@ -1136,12 +1266,25 @@ def probe_gcash(
                     checked_at=checked_at,
                 )
             return gcash_unavailable("gcash_evidence_incomplete", checked_at=checked_at)
-        return classify_gcash_evidence(
+        result = classify_gcash_evidence(
             payloads,
             require_zero=require_zero,
             checked_at=checked_at,
             trusted_custom_method_ids=trusted_custom_method_matches,
+            require_trusted_custom_method_match=custom_method_requires_roundtrip,
         )
+        result["custom_method_probe_status"] = custom_capability_status
+        result["custom_method_probe_failure"] = (
+            custom_capability_failure_codes[0]
+            if custom_capability_failure_codes
+            else ""
+        )
+        result["custom_method_probe_exception"] = (
+            custom_capability_failure_types[0]
+            if custom_capability_failure_types
+            else ""
+        )
+        return result
     except _ProbeFailure as exc:
         if exc.status_code in {400, 422}:
             return gcash_unavailable(exc.code, checked_at=checked_at)

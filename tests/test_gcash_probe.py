@@ -345,6 +345,275 @@ class GCashNetworkProbeTests(unittest.TestCase):
             "cpmt_dynamic_from_checkout",
         )
 
+    def test_checkout_method_roundtrip_accepts_a_nonliteral_elements_label(self):
+        """Stripe acceptance is stronger evidence than a merchant-defined label."""
+        method_id = "cpmt_dynamic_roundtrip"
+        checkout = {
+            "checkout_session_id": "cs_test_dynamic_roundtrip",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_dynamic_roundtrip",
+            "customer_session_client_secret": "cuss_dynamic_roundtrip",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [method_id],
+            "total_summary": {"due": 125000},
+            "currency": "PHP",
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({
+                "billing_details": {"country": "PH", "currency": "PHP"},
+                "custom_payment_methods": [method_id],
+            }),
+            FakeResponse({
+                "merchant_country": "PH",
+                "merchant_currency": "php",
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["method_available"])
+        self.assertTrue(result["trusted_custom_method_matched"])
+        self.assertNotIn(method_id, repr(result))
+        self.assertFalse(any(
+            "confirm" in url or "custom_payment_method/start" in url
+            for _, url, _ in session.calls
+        ))
+
+    def test_non_ph_roundtrip_does_not_mark_gcash_available(self):
+        method_id = "cpmt_non_ph_roundtrip"
+        checkout = {
+            "checkout_session_id": "cs_test_non_ph_roundtrip",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_non_ph_roundtrip",
+            "customer_session_client_secret": "cuss_non_ph_roundtrip",
+            "billing_details": {"country": "US", "currency": "USD"},
+            "custom_payment_methods": [method_id],
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({
+                "billing_details": {"country": "US", "currency": "USD"},
+                "custom_payment_methods": [method_id],
+            }),
+            FakeResponse({
+                "merchant_country": "US",
+                "merchant_currency": "usd",
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["method_available"])
+        self.assertFalse(result["trusted_custom_method_matched"])
+
+    def test_elements_must_echo_the_checkout_id_for_a_nonliteral_label(self):
+        checkout_method_id = "cpmt_checkout_candidate"
+        elements_method_id = "cpmt_different_elements_method"
+        checkout = {
+            "checkout_session_id": "cs_test_mismatched_roundtrip",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_mismatched_roundtrip",
+            "customer_session_client_secret": "cuss_mismatched_roundtrip",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [checkout_method_id],
+        }
+        session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({
+                "billing_details": {"country": "PH", "currency": "PHP"},
+                "custom_payment_methods": [checkout_method_id],
+            }),
+            FakeResponse({
+                "merchant_country": "PH",
+                "merchant_currency": "php",
+                "custom_payment_method_data": [{
+                    "type": elements_method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["method_available"])
+        self.assertFalse(result["trusted_custom_method_matched"])
+        self.assertNotIn(checkout_method_id, repr(result))
+        self.assertNotIn(elements_method_id, repr(result))
+
+    def test_elements_failure_exposes_only_a_stable_stage_code(self):
+        method_id = "cpmt_elements_failure"
+        checkout = {
+            "checkout_session_id": "cs_test_elements_failure",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_elements_failure",
+            "customer_session_client_secret": "cuss_elements_failure",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [method_id],
+        }
+
+        class ElementsFailureSession(FakeSession):
+            def get(self, url, **kwargs):
+                if url.endswith("/v1/elements/sessions"):
+                    raise RuntimeError("simulated transport failure")
+                return super().get(url, **kwargs)
+
+        session = ElementsFailureSession([
+            FakeResponse(checkout),
+            FakeResponse({"custom_payment_methods": [method_id]}),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["custom_method_probe_status"], "failed")
+        self.assertEqual(
+            result["custom_method_probe_failure"],
+            "stripe_custom_capability_transport_error",
+        )
+        self.assertEqual(result["custom_method_probe_exception"], "RuntimeError")
+        self.assertNotIn("simulated transport failure", repr(result))
+
+    def test_elements_capability_uses_a_separate_stripe_session(self):
+        method_id = "cpmt_separate_stripe_session"
+        checkout = {
+            "checkout_session_id": "cs_test_separate_stripe_session",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_separate_stripe_session",
+            "customer_session_client_secret": "cuss_separate_stripe_session",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [method_id],
+        }
+        chatgpt_session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"custom_payment_methods": [method_id]}),
+        ])
+        stripe_session = FakeSession([
+            FakeResponse({
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+        factories = []
+
+        def factory(**kwargs):
+            factories.append(kwargs)
+            return chatgpt_session if len(factories) == 1 else stripe_session
+
+        result = probe_gcash("access-token", session_factory=factory)
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(
+            [item["impersonate"] for item in factories],
+            ["chrome110", "firefox144"],
+        )
+        self.assertTrue(stripe_session.closed)
+        self.assertTrue(chatgpt_session.closed)
+
+    def test_elements_request_user_agent_matches_the_firefox_fingerprint(self):
+        method_id = "cpmt_firefox_user_agent"
+        checkout = {
+            "checkout_session_id": "cs_test_firefox_user_agent",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_firefox_user_agent",
+            "customer_session_client_secret": "cuss_firefox_user_agent",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [method_id],
+        }
+        chatgpt_session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"custom_payment_methods": [method_id]}),
+        ])
+        stripe_session = FakeSession([
+            FakeResponse({
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+        sessions = [chatgpt_session, stripe_session]
+
+        result = probe_gcash(
+            "access-token",
+            session_factory=lambda **_: sessions.pop(0),
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        stripe_headers = stripe_session.calls[0][2]["headers"]
+        self.assertIn("Firefox/144.0", stripe_headers["User-Agent"])
+        self.assertNotIn("Chrome/145.0.0.0", stripe_headers["User-Agent"])
+
+    def test_elements_transport_retries_with_an_alternate_fingerprint(self):
+        method_id = "cpmt_elements_retry"
+        checkout = {
+            "checkout_session_id": "cs_test_elements_retry",
+            "processor_entity": "openai_ie",
+            "publishable_key": "pk_test_elements_retry",
+            "customer_session_client_secret": "cuss_elements_retry",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "custom_payment_methods": [method_id],
+        }
+
+        class FlakyElementsSession(FakeSession):
+            def get(self, url, **kwargs):
+                if url.endswith("/v1/elements/sessions"):
+                    raise ConnectionError("simulated transient transport failure")
+                return super().get(url, **kwargs)
+
+        chatgpt_session = FakeSession([
+            FakeResponse(checkout),
+            FakeResponse({"custom_payment_methods": [method_id]}),
+        ])
+        flaky_stripe = FlakyElementsSession([])
+        recovered_stripe = FakeSession([
+            FakeResponse({
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+        factories = []
+
+        def factory(**kwargs):
+            factories.append(kwargs)
+            return [chatgpt_session, flaky_stripe, recovered_stripe][len(factories) - 1]
+
+        result = probe_gcash("access-token", session_factory=factory)
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(
+            [item["impersonate"] for item in factories],
+            ["chrome110", "firefox144", "chrome110"],
+        )
+        self.assertEqual(result["custom_method_probe_status"], "accepted")
+
     def test_probe_sends_source_promotion_and_tax_requests(self):
         checkout = {
             "checkout_session_id": "cs_test_method_only",
@@ -521,7 +790,10 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["proxy"], "socks5://proxy-user:proxy-pass@example.test:1080")
         self.assertTrue(session.closed)
         urls = [url for _, url, _ in session.calls]
-        self.assertEqual(len(urls), 5)
+        # A transport failure on the isolated Stripe capability session may
+        # trigger one bounded retry; neither attempt may enter a payment stage.
+        self.assertGreaterEqual(len(urls), 5)
+        self.assertLessEqual(len(urls), 6)
         self.assertTrue(any(url.endswith("/payments/checkout") for url in urls))
         self.assertTrue(any("/payments/checkout/openai_ie/cs_test_safe_probe" in url for url in urls))
         self.assertFalse(any("confirm" in url or "custom_payment_method/start" in url for url in urls))

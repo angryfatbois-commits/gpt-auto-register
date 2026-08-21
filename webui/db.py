@@ -707,7 +707,8 @@ _SAFE_ELIGIBILITY_FIELDS = frozenset({
     "campaign_title", "discount_percentage", "duration_periods",
     "duration_unit", "method_available", "custom_method_id_discovered",
     "amount_minor", "currency", "checkout_country", "check_scope", "method_evidence_present",
-    "trusted_custom_method_matched",
+    "trusted_custom_method_matched", "custom_method_probe_status",
+    "custom_method_probe_failure", "custom_method_probe_exception",
 })
 
 
