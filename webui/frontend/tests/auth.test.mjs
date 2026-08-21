@@ -27,3 +27,18 @@ test('protected layout disconnects tenant background work when it unmounts', asy
   assert.match(runtime, /function disconnectStreams\(/)
   assert.match(runtime, /clearTimeout\(autoReconnectTimer\)/)
 })
+
+test('legacy browser state can be claimed by only one administrator', async () => {
+  const { readTenantStorage, tenantStorageKey } = await import('../src/stores/tenant-storage.js')
+  const values = new Map([['legacy-settings', '{"proxy":"old"}']])
+  const storage = {
+    getItem: (key) => values.has(key) ? values.get(key) : null,
+    setItem: (key, value) => values.set(key, String(value)),
+  }
+
+  const alice = { id: 'alice-id', role: 'admin' }
+  const bob = { id: 'bob-id', role: 'admin' }
+  assert.equal(readTenantStorage(storage, 'legacy-settings', alice), '{"proxy":"old"}')
+  assert.equal(values.get(tenantStorageKey('legacy-settings', alice.id)), '{"proxy":"old"}')
+  assert.equal(readTenantStorage(storage, 'legacy-settings', bob), null)
+})

@@ -1,7 +1,9 @@
 import gc
 import tempfile
 import unittest
+import queue
 from pathlib import Path
+from unittest import mock
 
 from webui import auth, db
 
@@ -67,6 +69,54 @@ class AuthAndTenantTests(unittest.TestCase):
             auth.create_user("admin", "another-password", role="user")
         with self.assertRaises(auth.AuthorizationError):
             auth.delete_user(admin["id"], actor=admin)
+
+    def test_runtime_queues_and_auto_loop_controllers_are_tenant_scoped(self):
+        from webui import registrar
+        from webui.auto_loop import AutoLoopRegistry
+
+        first = auth.create_user("alice", "alice-password")
+        second = auth.create_user("bob", "bob-password")
+        first_queue = queue.Queue()
+        second_queue = queue.Queue()
+        try:
+            with db.use_database_path(first["db_path"]):
+                registrar._run_queues[registrar._queue_key("same-run")] = first_queue
+            with db.use_database_path(second["db_path"]):
+                registrar._run_queues[registrar._queue_key("same-run")] = second_queue
+            with db.use_database_path(first["db_path"]):
+                self.assertIs(registrar.get_run_queue("same-run"), first_queue)
+            with db.use_database_path(second["db_path"]):
+                self.assertIs(registrar.get_run_queue("same-run"), second_queue)
+
+            registry = AutoLoopRegistry()
+            self.assertIsNot(registry.get(first["db_path"]), registry.get(second["db_path"]))
+            self.assertIs(registry.get(first["db_path"]), registry.get(first["db_path"]))
+        finally:
+            registrar._run_queues.clear()
+
+    def test_auto_loop_closes_each_status_poll_connection(self):
+        from webui.auto_loop import AutoLoopController
+
+        class Cursor:
+            @staticmethod
+            def fetchone():
+                return {"status": "done", "error_category": None}
+
+        class Connection:
+            closed = False
+
+            @staticmethod
+            def execute(*_args, **_kwargs):
+                return Cursor()
+
+            def close(self):
+                self.closed = True
+
+        connection = Connection()
+        controller = AutoLoopController(self._temp_dir.name)
+        with mock.patch.object(db, "_conn", return_value=connection):
+            self.assertEqual(controller._wait_run_finish("run-id"), (True, ""))
+        self.assertTrue(connection.closed)
 
 
 if __name__ == "__main__":
