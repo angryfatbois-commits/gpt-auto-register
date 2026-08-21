@@ -354,6 +354,8 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
     explicit_method_collection = False
     custom_candidate_present = False
     custom_non_gcash_present = False
+    custom_candidate_ids: set[str] = set()
+    custom_non_gcash_ids: set[str] = set()
     custom_ids: list[str] = []
     method_tokens: list[str] = []
     amounts: set[int] = set()
@@ -389,10 +391,13 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
                         if key_text in {"custom_payment_methods", "custom_payment_method_data"}:
                             if _has_non_gcash_label(method):
                                 custom_non_gcash_present = True
+                                custom_non_gcash_ids.update(ids)
                             elif ids:
                                 custom_candidate_present = True
+                                custom_candidate_ids.update(ids)
                         elif ids and not _has_non_gcash_label(method):
                             custom_candidate_present = True
+                            custom_candidate_ids.update(ids)
                 elif key_text in _METHOD_SCALAR_KEYS:
                     explicit_method_collection = True
                     found, ids, tokens = _inspect_method(value)
@@ -409,8 +414,10 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
                     if ids:
                         if _has_non_gcash_label(value):
                             custom_non_gcash_present = True
+                            custom_non_gcash_ids.update(ids)
                         else:
                             custom_candidate_present = True
+                            custom_candidate_ids.update(ids)
 
                 if key_text in {"currency", "currency_code"} and isinstance(value, str):
                     currency = value.strip().upper()
@@ -438,6 +445,10 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
 
     if method_present:
         method_available: bool | None = True
+    elif custom_candidate_ids - custom_non_gcash_ids:
+        # A response may describe more than one custom method. A negative
+        # label for one opaque ID must not hide a different candidate ID.
+        method_available = True
     elif custom_non_gcash_present:
         method_available = False
     elif custom_candidate_present:
