@@ -200,6 +200,20 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertFalse(result["method_available"])
 
+    def test_unrelated_non_gcash_custom_method_does_not_override_gcash_candidate(self):
+        result = classify_gcash_evidence([
+            {"custom_payment_methods": ["cpmt_candidate_one"]},
+            {
+                "custom_payment_method_data": [
+                    {"id": "cpmt_other_wallet", "display_name": "Other wallet"}
+                ]
+            },
+        ])
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["method_available"])
+
     def test_generic_custom_payment_placeholder_without_id_is_ineligible(self):
         result = classify_gcash_evidence([
             {"payment_method_types": ["card", "custom_payment_method"]}
