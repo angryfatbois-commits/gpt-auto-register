@@ -175,6 +175,31 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertTrue(result["method_available"])
         self.assertTrue(result["custom_method_id_discovered"])
 
+    def test_scalar_custom_method_id_is_a_gcash_candidate(self):
+        """Checkout may return the opaque custom method in a scalar field."""
+        result = classify_gcash_evidence([
+            {"custom_payment_method_type_id": "cpmt_scalar_discovered"}
+        ])
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["method_available"])
+        self.assertTrue(result["custom_method_id_discovered"])
+
+    def test_scalar_custom_method_object_with_non_gcash_label_is_ineligible(self):
+        result = classify_gcash_evidence([
+            {
+                "custom_payment_method": {
+                    "id": "cpmt_scalar_discovered",
+                    "display_name": "Other wallet",
+                }
+            }
+        ])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertFalse(result["method_available"])
+
     def test_generic_custom_payment_placeholder_without_id_is_ineligible(self):
         result = classify_gcash_evidence([
             {"payment_method_types": ["card", "custom_payment_method"]}
