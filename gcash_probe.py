@@ -1101,7 +1101,11 @@ def probe_gcash(
             # fresh transport while retaining the stable browser identity.
             # Never retry a known country mismatch, never remove PH/PHP, and
             # never fall back outside the selected proxy.
-            if exc.code not in {"checkout_http_400", "checkout_http_422"}:
+            if exc.code not in {
+                "checkout_http_400",
+                "checkout_http_422",
+                "checkout_promotion_rejected",
+            }:
                 raise
             _LOGGER.info(
                 "[gcash_probe] checkout compatibility retry reason=%s",
