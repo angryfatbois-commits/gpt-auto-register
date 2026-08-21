@@ -243,12 +243,21 @@ one bounded retry on transport-only failures. Proxy credentials, access
 tokens, cookies, checkout session IDs, customer secrets, and raw upstream
 bodies are excluded from stored eligibility results.
 
+ChatGPT checkout calls use a complete Chrome browser profile: the TLS
+fingerprint, User-Agent, client hints, language, client version/build, device
+ID, and per-probe session ID remain consistent across create, compatibility
+retry, update, taxes, and resolve. JSON checkout POSTs use a one-shot transport
+so cookies accumulated by a long-lived HTTP session cannot override the
+account cookie header. The selected proxy is still retained and direct fallback
+remains disabled.
+
 If the source-compatible checkout create payload receives a generic HTTP
-400/422, the probe makes one bounded compatibility attempt with a fresh browser
-session. That attempt keeps the same selected proxy and PH/PHP region but omits
-the optional promotion and card-proxy fields; promotion remains a best-effort
-update after checkout creation. A recognized billing-country mismatch is never
-retried, and neither path calls confirmation or payment-execution endpoints.
+400/422, the probe makes one bounded compatibility attempt with a fresh HTTP
+transport and the same stable browser identity. That attempt keeps the same
+selected proxy and PH/PHP region but omits the optional promotion and card-proxy
+fields; promotion remains a best-effort update after checkout creation. A
+recognized billing-country mismatch is never retried, and neither path calls
+confirmation or payment-execution endpoints.
 
 ## Stored Results
 

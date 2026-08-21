@@ -49,6 +49,12 @@ does not invent a billing address or submit payment credentials. Update/tax
 failures are retained as technical diagnostics and do not erase affirmative
 method evidence.
 
+The target also follows the source project's browser-identity boundary for
+ChatGPT requests: TLS impersonation, User-Agent/client hints, device identity,
+and a per-probe browser session remain consistent. Checkout JSON POSTs use an
+isolated one-shot transport so a reusable session cannot merge unrelated
+Cloudflare cookies into the stored account cookie header.
+
 `GCASH_CUSTOM_PAYMENT_METHOD_ID` is an optional deployment setting for an
 opaque custom-method ID that the operator has independently verified. The
 application does not embed the source repository's opaque identifier.

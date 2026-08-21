@@ -1,5 +1,9 @@
 # GCash checkout compatibility retry TDD evidence
 
+> Historical note: the alternate-fingerprint retry documented here was later
+> superseded by the stable browser-identity and isolated transport described in
+> `gcash-browser-transport.tdd.md`.
+
 ## User journey
 
 As an administrator, I want a generic checkout-create rejection to receive one
