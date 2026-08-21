@@ -1,7 +1,7 @@
 # Dependencies for HTTP-only ChatGPT registration with Outlook
 
 # HTTP client with TLS fingerprint impersonation (required for Cloudflare)
-curl-cffi>=0.15.0,<0.17.0
+curl-cffi>=0.16.0,<0.17.0
 requests>=2.31.0
 
 # Optional WebUI dependencies; not required for register_outlook.py alone
