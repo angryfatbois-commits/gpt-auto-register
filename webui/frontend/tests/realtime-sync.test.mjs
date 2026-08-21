@@ -209,6 +209,7 @@ test('cached pool, registered-account, and run views subscribe to data invalidat
   for (const name of ['Pool.vue', 'Registered.vue', 'Runs.vue']) {
     const view = await readFile(new URL(`../src/views/${name}`, import.meta.url), 'utf8')
     assert.match(view, /watch\(dataVersion,\s*\(\)\s*=>\s*load\(\)\)/, name)
+    assert.match(view, /onMounted\(\(\)\s*=>\s*load\(\)\)/, name)
     assert.match(view, /onActivated\(\(\)\s*=>\s*load\(\)\)/, name)
   }
 })
