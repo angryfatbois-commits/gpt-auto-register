@@ -15,6 +15,7 @@ import logging
 import queue
 import threading
 import time
+from pathlib import Path
 from typing import Optional
 
 from . import db, registrar
@@ -50,7 +51,10 @@ class AutoLoopController:
       remaining values pass through to registrar.start_registration
     """
 
-    def __init__(self):
+    def __init__(self, database_path: str | Path | None = None):
+        self._database_path = Path(
+            database_path if database_path is not None else db.current_db_path()
+        ).resolve()
         self._lock = threading.RLock()
         self._state = AutoLoopState.STOPPED
         self._manage_thread: Optional[threading.Thread] = None
@@ -165,7 +169,7 @@ class AutoLoopController:
     # -------------------------------- Internals --------------------------------
 
     def _snapshot(self) -> dict:
-        with self._lock:
+        with db.use_database_path(self._database_path), self._lock:
             stats = db.stats()
             workers_info = [
                 {
@@ -297,6 +301,11 @@ class AutoLoopController:
             self._broadcast("state", self._snapshot())
 
     def _worker_loop(self, worker_id: int):
+        """Bind this worker to its owner's database for its entire lifetime."""
+        with db.use_database_path(self._database_path):
+            self._worker_loop_scoped(worker_id)
+
+    def _worker_loop_scoped(self, worker_id: int):
         """Run one worker's claim -> start -> wait -> repeat loop."""
         idle_round = 0
         proxy = self._proxy_for_worker(worker_id)
@@ -426,10 +435,13 @@ class AutoLoopController:
             if self._stop_event.is_set():
                 return False, ""
             con = db._conn()
-            cur = con.execute(
-                "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
-            )
-            row = cur.fetchone()
+            try:
+                cur = con.execute(
+                    "SELECT status, error_category FROM runs WHERE run_id=?", (run_id,)
+                )
+                row = cur.fetchone()
+            finally:
+                con.close()
             if row:
                 st = row["status"]
                 if st == "done":
@@ -441,5 +453,33 @@ class AutoLoopController:
         return False, ""
 
 
-# Global singleton.
-CONTROLLER = AutoLoopController()
+class AutoLoopRegistry:
+    """Return one independent controller for each physical tenant database."""
+
+    def __init__(self):
+        self._lock = threading.RLock()
+        self._controllers: dict[str, AutoLoopController] = {}
+
+    def get(self, database_path: str | Path | None = None) -> AutoLoopController:
+        selected = Path(
+            database_path if database_path is not None else db.current_db_path()
+        ).resolve()
+        key = str(selected)
+        with self._lock:
+            controller = self._controllers.get(key)
+            if controller is None:
+                controller = AutoLoopController(selected)
+                self._controllers[key] = controller
+            return controller
+
+
+REGISTRY = AutoLoopRegistry()
+
+
+def get_controller() -> AutoLoopController:
+    return REGISTRY.get()
+
+
+# Compatibility object for direct legacy imports. Authenticated HTTP routes use
+# get_controller() and never share this instance across users.
+CONTROLLER = REGISTRY.get(db.DB_PATH)

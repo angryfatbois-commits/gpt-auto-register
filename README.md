@@ -15,6 +15,8 @@ and mailbox providers to complete registration without browser automation.
 - Optional SMS verification through supported activation providers
 - Concurrent registration workers and proxy-pool rotation
 - FastAPI backend with a Vue 3 and Element Plus WebUI
+- Session-based WebUI authentication and an administrator user panel
+- Independent SQLite data, registration queues, logs, and auto-loop state per user
 - Account credential storage and configurable export formats
 - Exact `plus-1-month-free` Plus trial eligibility checks
 - Side-effect-limited GCash payment-method availability checks
@@ -43,6 +45,30 @@ npm --prefix webui/frontend run build
 
 ## Start the WebUI
 
+### First administrator
+
+On the first local start, open the WebUI and use **First-time setup**. The
+one-time setup endpoint accepts requests only from a loopback address and is
+disabled permanently after the first user is created.
+
+For a non-interactive server or reverse-proxy deployment, bootstrap the first
+administrator with environment variables before starting the process:
+
+```powershell
+$env:GPT_WEBUI_ADMIN_USERNAME = "admin"
+$env:GPT_WEBUI_ADMIN_PASSWORD = "use-a-long-random-password"
+python start_webui.py
+```
+
+There is no default password in the source code. Passwords are stored as
+salted `scrypt` hashes. Sessions use an opaque HttpOnly cookie, while every
+state-changing API request also requires a session-bound CSRF token. Set
+`GPT_WEBUI_COOKIE_SECURE=1` when the WebUI is served over HTTPS.
+
+Advanced deployments can relocate the control database and tenant directory
+with `GPT_WEBUI_AUTH_DB` and `GPT_WEBUI_USER_DATA_DIR`. Keep both locations on
+private persistent storage and include them in encrypted backups.
+
 ```bash
 python start_webui.py
 ```
@@ -55,8 +81,16 @@ To listen on another interface or port:
 python start_webui.py --host 0.0.0.0 --port 8765
 ```
 
-Do not expose the WebUI to an untrusted network without an authentication
-layer. It can display and export account credentials.
+The first administrator can open **Administration / User management** to create
+additional users. Each user receives a separate SQLite database under
+`webui/user_data/`, as well as isolated registration queues, SSE streams, log
+directories, and auto-loop controller state. The first administrator receives
+an online SQLite backup of the legacy `webui/webui.db`; the original file is
+left untouched as a recovery copy.
+
+Authentication does not replace transport security. Use HTTPS, a trusted
+reverse proxy, and `GPT_WEBUI_COOKIE_SECURE=1` before exposing the WebUI beyond
+localhost. The UI can display and export sensitive account credentials.
 
 ## Command-line Registration
 
@@ -221,8 +255,12 @@ gcash_check
 No database migration is required. If a later attempt is inconclusive, its
 record retains the last conclusive verdict for reference.
 
-The local database is `webui/webui.db`. It is ignored by Git and may contain
-sensitive credentials. Back it up before upgrading, and never commit it.
+The pre-authentication legacy database is `webui/webui.db`; it remains ignored
+by Git and is copied to the first administrator's tenant database on initial
+setup. Authentication metadata is stored separately in `webui/auth.db`, and
+new user databases are created under `webui/user_data/`. All of these files may
+contain sensitive credentials or account metadata: back them up securely and
+never commit them.
 
 ## Tests
 

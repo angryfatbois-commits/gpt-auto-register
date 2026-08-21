@@ -38,6 +38,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   let currentEs = null
   let autoEs = null
+  let autoReconnectTimer = null
+  let autoStreamWanted = false
 
   function addLog(text, kind) {
     logs.value.push({ id: ++_logId, text, kind: kind ?? classify(text) })
@@ -98,6 +100,11 @@ export const useRuntimeStore = defineStore('runtime', () => {
 
   // ─── Global automatic-run SSE, connected at startup with automatic reconnect ───
   function connectAutoStream() {
+    autoStreamWanted = true
+    if (autoReconnectTimer) {
+      clearTimeout(autoReconnectTimer)
+      autoReconnectTimer = null
+    }
     if (autoEs) { try { autoEs.close() } catch (_) {} }
     const es = createSSE('/api/auto/stream', {
       state: (e) => {
@@ -129,14 +136,38 @@ export const useRuntimeStore = defineStore('runtime', () => {
     }, () => {
       // Reconnect automatically after a disconnect.
       try { es.close() } catch (_) {}
+      if (autoEs !== es || !autoStreamWanted) return
       autoEs = null
-      setTimeout(connectAutoStream, 2000)
+      autoReconnectTimer = setTimeout(() => {
+        autoReconnectTimer = null
+        if (autoStreamWanted) connectAutoStream()
+      }, 2000)
     })
     autoEs = es
   }
 
+  function disconnectStreams() {
+    // Flip the intent before closing EventSource objects. Some browsers emit
+    // an error event synchronously from close(), and that event must not
+    // schedule a new connection after logout/unmount.
+    autoStreamWanted = false
+    if (autoReconnectTimer) {
+      clearTimeout(autoReconnectTimer)
+      autoReconnectTimer = null
+    }
+    if (currentEs) {
+      try { currentEs.close() } catch (_) {}
+      currentEs = null
+    }
+    if (autoEs) {
+      try { autoEs.close() } catch (_) {}
+      autoEs = null
+    }
+    runningSingle.value = false
+  }
+
   return {
     logs, autoStatus, banner, lastRunResult, dataVersion, runningSingle,
-    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream,
+    addLog, clearLogs, bumpData, dismissBanner, streamRun, connectAutoStream, disconnectStreams,
   }
 })

@@ -16,7 +16,10 @@ constrainable, and visible to SQL; add a column when a provider needs new data.
 from __future__ import annotations
 
 import base64
+import contextlib
+import contextvars
 import json
+import os
 import sqlite3
 import sys
 import threading
@@ -30,20 +33,75 @@ if str(_ROOT) not in sys.path:
 
 from gcash_probe import normalize_gcash_result
 
-DB_PATH = Path(__file__).resolve().parent / "webui.db"
+DB_PATH = Path(
+    os.getenv("GPT_WEBUI_LEGACY_DB", str(Path(__file__).resolve().parent / "webui.db"))
+).expanduser().resolve()
 
-_lock = threading.Lock()  # Serialize SQLite writes.
+_active_db_path: contextvars.ContextVar[Path | None] = contextvars.ContextVar(
+    "webui_active_db_path", default=None
+)
+_lock_registry_guard = threading.Lock()
+_lock_registry: dict[str, threading.RLock] = {}
+# Keep the historical module lock for callers and tests that use the existing
+# write paths. Tenant databases are separate files; this lock only serializes
+# SQLite writes conservatively across the process.
+_lock = threading.RLock()
 
 
-def _conn() -> sqlite3.Connection:
-    con = sqlite3.connect(str(DB_PATH), check_same_thread=False, timeout=30)
+def current_db_path() -> Path:
+    """Return the request/worker tenant database, or the legacy database."""
+    selected = _active_db_path.get()
+    return Path(selected if selected is not None else DB_PATH).resolve()
+
+
+@contextlib.contextmanager
+def use_database_path(path: str | Path):
+    """Select one tenant database for the current request or worker context."""
+    selected = Path(path).resolve()
+    token = _active_db_path.set(selected)
+    try:
+        yield selected
+    finally:
+        _active_db_path.reset(token)
+
+
+def _database_lock() -> threading.RLock:
+    key = str(current_db_path())
+    with _lock_registry_guard:
+        return _lock_registry.setdefault(key, threading.RLock())
+
+
+@contextlib.contextmanager
+def _write_lock():
+    lock = _database_lock()
+    with lock:
+        yield
+
+
+def _conn(path: str | Path | None = None) -> sqlite3.Connection:
+    selected = Path(path).resolve() if path is not None else current_db_path()
+    selected.parent.mkdir(parents=True, exist_ok=True)
+    con = sqlite3.connect(str(selected), check_same_thread=False, timeout=30)
     con.row_factory = sqlite3.Row
     con.execute("PRAGMA journal_mode=WAL")
     return con
 
 
-def init_db():
-    con = _conn()
+@contextlib.contextmanager
+def _connection(path: str | Path | None = None):
+    """Yield a SQLite connection and always release it after the operation."""
+    con = _conn(path)
+    try:
+        yield con
+    finally:
+        con.close()
+
+
+def init_db(path: str | Path | None = None):
+    if path is not None and Path(path).resolve() != current_db_path():
+        with use_database_path(path):
+            return init_db()
+    con = _conn(path)
     con.executescript("""
         CREATE TABLE IF NOT EXISTS outlook_accounts (
             email           TEXT PRIMARY KEY,
@@ -136,6 +194,20 @@ def init_db():
     con.close()
 
 
+def backup_database(source: str | Path, target: str | Path) -> None:
+    """Copy a SQLite database with the online backup API.
+
+    The source remains untouched. This is used once when the first WebUI admin
+    adopts data from the pre-authentication legacy database.
+    """
+    source_path = Path(source).resolve()
+    target_path = Path(target).resolve()
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    with contextlib.closing(sqlite3.connect(str(source_path), timeout=30)) as src:
+        with contextlib.closing(sqlite3.connect(str(target_path), timeout=30)) as dst:
+            src.backup(dst)
+
+
 # ------------------------------- Outlook account pool -------------------------------
 
 
@@ -162,8 +234,7 @@ def import_accounts(text: str, kind: str = "") -> dict:
     rows = parse_lines(text, kind)
     now = time.time()
     inserted = updated = skipped = 0
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         for r in rows:
             row_kind = r.get("kind") or kind or "outlook"
             # Providers use different subsets of the credential union; others stay blank.
@@ -205,7 +276,6 @@ def import_accounts(text: str, kind: str = "") -> dict:
 
 
 def count_accounts(status: str = "", kind: str = "") -> int:
-    con = _conn()
     sql = "SELECT COUNT(*) FROM outlook_accounts"
     where, args = [], []
     if status:
@@ -216,13 +286,13 @@ def count_accounts(status: str = "", kind: str = "") -> int:
         args.append(kind.strip().lower())
     if where:
         sql += " WHERE " + " AND ".join(where)
-    return con.execute(sql, args).fetchone()[0]
+    with _connection() as con:
+        return con.execute(sql, args).fetchone()[0]
 
 
 def list_accounts(
     status: str = "", limit: int = 50, offset: int = 0, kind: str = ""
 ) -> list[dict]:
-    con = _conn()
     sql = "SELECT * FROM outlook_accounts"
     where, args = [], []
     if status:
@@ -235,31 +305,32 @@ def list_accounts(
         sql += " WHERE " + " AND ".join(where)
     sql += " ORDER BY imported_at DESC LIMIT ? OFFSET ?"
     args += [limit, offset]
-    return [dict(r) for r in con.execute(sql, args).fetchall()]
+    with _connection() as con:
+        return [dict(r) for r in con.execute(sql, args).fetchall()]
 
 
 def stats_by_kind() -> dict:
     """Return account counts by provider kind for the WebUI summary."""
-    con = _conn()
-    cur = con.execute(
-        "SELECT kind, status, COUNT(*) AS n FROM outlook_accounts GROUP BY kind, status"
-    )
     out: dict[str, dict] = {}
-    for r in cur.fetchall():
-        k = r["kind"] or "outlook"
-        slot = out.setdefault(
-            k, {"available": 0, "in_use": 0, "done": 0, "failed": 0, "total": 0}
+    with _connection() as con:
+        cur = con.execute(
+            "SELECT kind, status, COUNT(*) AS n FROM outlook_accounts GROUP BY kind, status"
         )
-        slot[r["status"]] = r["n"]
-        slot["total"] += r["n"]
+        for r in cur.fetchall():
+            k = r["kind"] or "outlook"
+            slot = out.setdefault(
+                k, {"available": 0, "in_use": 0, "done": 0, "failed": 0, "total": 0}
+            )
+            slot[r["status"]] = r["n"]
+            slot["total"] += r["n"]
     return out
 
 
 def get_account(email: str) -> Optional[dict]:
-    con = _conn()
-    cur = con.execute("SELECT * FROM outlook_accounts WHERE email=?", (email.lower(),))
-    row = cur.fetchone()
-    return dict(row) if row else None
+    with _connection() as con:
+        cur = con.execute("SELECT * FROM outlook_accounts WHERE email=?", (email.lower(),))
+        row = cur.fetchone()
+        return dict(row) if row else None
 
 
 def claim_account(email: str) -> Optional[dict]:
@@ -273,8 +344,7 @@ def claim_account(email: str) -> Optional[dict]:
     email = (email or "").strip().lower()
     if not email:
         return None
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         cur = con.execute(
             "SELECT * FROM outlook_accounts WHERE email=? AND status IN ('available', 'failed')",
             (email,),
@@ -302,8 +372,7 @@ def claim_next(kind: str = "") -> Optional[dict]:
     Provider filtering prevents mixed Outlook/Gmail pools from crossing sources.
     """
     k = (kind or "").strip().lower()
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         for _ in range(50):  # Bounded retries avoid recursion during contention.
             if k:
                 cur = con.execute(
@@ -332,8 +401,7 @@ def claim_next(kind: str = "") -> Optional[dict]:
 
 
 def mark_done(email: str) -> None:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "UPDATE outlook_accounts SET status='done', finished_at=?, fail_reason=NULL WHERE email=?",
             (time.time(), email.lower()),
@@ -342,8 +410,7 @@ def mark_done(email: str) -> None:
 
 
 def mark_failed(email: str, reason: str = "") -> None:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "UPDATE outlook_accounts SET status='failed', finished_at=?, fail_reason=? WHERE email=?",
             (time.time(), (reason or "")[:500], email.lower()),
@@ -353,8 +420,7 @@ def mark_failed(email: str, reason: str = "") -> None:
 
 def release_unused(email: str) -> None:
     """Return an unregistered claim to available after cancellation or error."""
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
             "WHERE email=? AND status='in_use'",
@@ -369,8 +435,7 @@ def reset_to_available(email: str) -> bool:
     This supports rerunning an account whose registration completed without a
     refresh token.
     """
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
             "finished_at=NULL, fail_reason=NULL "
@@ -385,8 +450,7 @@ def bulk_reset_to_available(emails: list[str]) -> int:
     """Reset multiple accounts and return the number of changed rows."""
     if not emails:
         return 0
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute(
             f"UPDATE outlook_accounts SET status='available', claimed_at=NULL, "
             f"finished_at=NULL, fail_reason=NULL "
@@ -402,8 +466,7 @@ def reset_failed_to_available() -> int:
 
     Useful when a transient proxy outage incorrectly marks a batch failed.
     """
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', fail_reason=NULL, "
             "finished_at=NULL WHERE status='failed'"
@@ -417,8 +480,7 @@ def release_stale_in_use(stale_seconds: float = 1800) -> int:
 
     This recovers claims stranded by a crashed or forcibly stopped WebUI process.
     """
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         cutoff = time.time() - stale_seconds
         rc = con.execute(
             "UPDATE outlook_accounts SET status='available', claimed_at=NULL "
@@ -430,8 +492,7 @@ def release_stale_in_use(stale_seconds: float = 1800) -> int:
 
 
 def delete_account(email: str) -> bool:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute("DELETE FROM outlook_accounts WHERE email=?", (email.lower(),))
         con.commit()
         return rc.rowcount > 0
@@ -443,8 +504,7 @@ def delete_accounts_by_status(status: str) -> int:
     s = (status or "").strip().lower()
     if s not in valid:
         return 0
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         if s == "all":
             rc = con.execute("DELETE FROM outlook_accounts")
         else:
@@ -458,8 +518,7 @@ def delete_accounts_by_emails(emails: list[str]) -> int:
     cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
     if not cleaned:
         return 0
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         placeholders = ",".join("?" * len(cleaned))
         rc = con.execute(
             f"DELETE FROM outlook_accounts WHERE email IN ({placeholders})",
@@ -470,14 +529,14 @@ def delete_accounts_by_emails(emails: list[str]) -> int:
 
 
 def stats() -> dict:
-    con = _conn()
-    cur = con.execute(
-        "SELECT status, COUNT(*) AS n FROM outlook_accounts GROUP BY status"
-    )
     out = {"available": 0, "in_use": 0, "done": 0, "failed": 0, "total": 0}
-    for r in cur.fetchall():
-        out[r["status"]] = r["n"]
-        out["total"] += r["n"]
+    with _connection() as con:
+        cur = con.execute(
+            "SELECT status, COUNT(*) AS n FROM outlook_accounts GROUP BY status"
+        )
+        for r in cur.fetchall():
+            out[r["status"]] = r["n"]
+            out["total"] += r["n"]
     return out
 
 
@@ -499,8 +558,7 @@ def save_registered(d: dict) -> None:
         "id_token", "device_id", "csrf_token", "cookie_header",
         "totp_secret", "totp_factor_id",
     }}
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         # INSERT OR REPLACE replaces the whole row, so preserve durable values that
         # a rerun may omit. A password set before an OTP timeout still exists even
         # when a later passwordless login returns no password. Likewise, a one-time
@@ -562,8 +620,7 @@ def save_password_early(email: str, password: str) -> None:
     password = (password or "").strip()
     if not email or not password:
         return
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "INSERT INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
@@ -595,8 +652,7 @@ def save_totp_early(email: str, secret: str, factor_id: str = "") -> None:
     if not email or not secret:
         return
     factor_id = (factor_id or "").strip()
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "INSERT INTO registered "
             "(email, password, access_token, session_token, refresh_token, "
@@ -688,8 +744,7 @@ def update_registered_manual(email: str, password: Optional[str] = None,
         vals.append(normalize_totp_secret(totp_secret) if totp_secret.strip() else "")
     if not sets:
         return False
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         row = con.execute("SELECT email FROM registered WHERE email=?", (email,)).fetchone()
         if not row:
             return False
@@ -742,8 +797,7 @@ def update_eligibility_check(email: str, key: str, result: dict) -> None:
     safe = _safe_eligibility_result(result)
     if key == "gcash_check":
         safe = _safe_eligibility_result(normalize_gcash_result(safe))
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         try:
             row = con.execute(
                 "SELECT extra_json FROM registered WHERE email=?", (email,)
@@ -802,9 +856,9 @@ def _registered_where(filt: str) -> str:
 
 
 def count_registered(filter_rt: str = "all") -> int:
-    con = _conn()
-    cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt)}")
-    return cur.fetchone()[0]
+    with _connection() as con:
+        cur = con.execute(f"SELECT COUNT(*) FROM registered {_registered_where(filter_rt)}")
+        return cur.fetchone()[0]
 
 
 def list_registered(limit: int = 20, offset: int = 0, filter_rt: str = "all") -> list[dict]:
@@ -847,23 +901,23 @@ def list_registered_full(limit: int = 5000) -> list[dict]:
     tokenized inbox URL per pooled account. LEFT JOIN avoids migration, supports
     old registered rows while their pool row exists, and yields blank otherwise.
     """
-    con = _conn()
-    cur = con.execute(
-        "SELECT r.*, a.relay_url AS relay_url "
-        "FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
-        "ORDER BY r.created_at DESC LIMIT ?",
-        (limit,),
-    )
     out = []
-    for row in cur.fetchall():
-        d = dict(row)
-        if d.get("extra_json"):
-            try:
-                d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
-            except Exception:
-                d["extra"] = {}
-        d.pop("extra_json", None)
-        out.append(d)
+    with _connection() as con:
+        cur = con.execute(
+            "SELECT r.*, a.relay_url AS relay_url "
+            "FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
+            "ORDER BY r.created_at DESC LIMIT ?",
+            (limit,),
+        )
+        for row in cur.fetchall():
+            d = dict(row)
+            if d.get("extra_json"):
+                try:
+                    d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
+                except Exception:
+                    d["extra"] = {}
+            d.pop("extra_json", None)
+            out.append(d)
     return out
 
 
@@ -877,27 +931,27 @@ def list_registered_by_emails(emails: list[str]) -> list[dict]:
     if not cleaned:
         return []
 
-    con = _conn()
     out = []
     CHUNK = 500
-    for i in range(0, len(cleaned), CHUNK):
-        part = cleaned[i:i + CHUNK]
-        placeholders = ",".join("?" * len(part))
-        cur = con.execute(
-            f"SELECT r.*, a.relay_url AS relay_url "
-            f"FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
-            f"WHERE r.email IN ({placeholders})",
-            part,
-        )
-        for row in cur.fetchall():
-            d = dict(row)
-            if d.get("extra_json"):
-                try:
-                    d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
-                except Exception:
-                    d["extra"] = {}
-            d.pop("extra_json", None)
-            out.append(d)
+    with _connection() as con:
+        for i in range(0, len(cleaned), CHUNK):
+            part = cleaned[i:i + CHUNK]
+            placeholders = ",".join("?" * len(part))
+            cur = con.execute(
+                f"SELECT r.*, a.relay_url AS relay_url "
+                f"FROM registered r LEFT JOIN outlook_accounts a ON a.email = r.email "
+                f"WHERE r.email IN ({placeholders})",
+                part,
+            )
+            for row in cur.fetchall():
+                d = dict(row)
+                if d.get("extra_json"):
+                    try:
+                        d["extra"] = _normalize_extra_gcash(json.loads(d["extra_json"]))
+                    except Exception:
+                        d["extra"] = {}
+                d.pop("extra_json", None)
+                out.append(d)
 
     out.sort(key=lambda d: d.get("created_at") or 0, reverse=True)
     return out
@@ -923,8 +977,7 @@ def get_registered(email: str) -> Optional[dict]:
 
 
 def delete_registered(email: str) -> bool:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute("DELETE FROM registered WHERE email=?", (email.lower(),))
         con.commit()
         return rc.rowcount > 0
@@ -934,8 +987,7 @@ def delete_registered_by_emails(emails: list[str]) -> int:
     cleaned = [e.strip().lower() for e in (emails or []) if e and e.strip()]
     if not cleaned:
         return 0
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         placeholders = ",".join("?" * len(cleaned))
         rc = con.execute(
             f"DELETE FROM registered WHERE email IN ({placeholders})",
@@ -946,8 +998,7 @@ def delete_registered_by_emails(emails: list[str]) -> int:
 
 
 def delete_all_registered() -> int:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         rc = con.execute("DELETE FROM registered")
         con.commit()
         return rc.rowcount
@@ -957,8 +1008,7 @@ def delete_all_registered() -> int:
 
 
 def create_run(run_id: str, email: str, log_path: str) -> None:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "INSERT INTO runs(run_id, email, status, started_at, log_path) "
             "VALUES (?, ?, 'running', ?, ?)",
@@ -968,8 +1018,7 @@ def create_run(run_id: str, email: str, log_path: str) -> None:
 
 
 def finish_run(run_id: str, status: str, error: str = "", category: str = "") -> None:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "UPDATE runs SET status=?, finished_at=?, error=?, error_category=? WHERE run_id=?",
             (status, time.time(), (error or "")[:500], category or None, run_id),
@@ -978,26 +1027,34 @@ def finish_run(run_id: str, status: str, error: str = "", category: str = "") ->
 
 
 def list_runs(limit: int = 50) -> list[dict]:
+    with _connection() as con:
+        cur = con.execute(
+            "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,),
+        )
+        return [dict(r) for r in cur.fetchall()]
+
+
+def get_run(run_id: str) -> Optional[dict]:
     con = _conn()
-    cur = con.execute(
-        "SELECT * FROM runs ORDER BY started_at DESC LIMIT ?", (limit,),
-    )
-    return [dict(r) for r in cur.fetchall()]
+    try:
+        row = con.execute("SELECT * FROM runs WHERE run_id=?", (str(run_id),)).fetchone()
+        return dict(row) if row else None
+    finally:
+        con.close()
 
 
 # ──────────────────────── settings (KV) ────────────────────────
 
 
 def get_setting(key: str, default: str = "") -> str:
-    con = _conn()
-    cur = con.execute("SELECT value FROM settings WHERE key=?", (key,))
-    row = cur.fetchone()
-    return row["value"] if row else default
+    with _connection() as con:
+        cur = con.execute("SELECT value FROM settings WHERE key=?", (key,))
+        row = cur.fetchone()
+        return row["value"] if row else default
 
 
 def set_setting(key: str, value) -> None:
-    with _lock:
-        con = _conn()
+    with _lock, _connection() as con:
         con.execute(
             "INSERT INTO settings(key, value) VALUES (?, ?) "
             "ON CONFLICT(key) DO UPDATE SET value=excluded.value",

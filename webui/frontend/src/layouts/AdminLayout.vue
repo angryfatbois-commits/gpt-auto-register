@@ -1,27 +1,30 @@
 <script setup>
-import { computed, onMounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
 import { useStatsStore } from '@/stores/stats'
 import { useRuntimeStore } from '@/stores/runtime'
+import { useAuthStore } from '@/stores/auth'
 
 const route = useRoute()
 const router = useRouter()
 const theme = useThemeStore()
 const statsStore = useStatsStore()
 const runtime = useRuntimeStore()
+const auth = useAuthStore()
 const { stats } = storeToRefs(statsStore)
 const { banner } = storeToRefs(runtime)
 
 const collapse = ref(false)
 const adDismissed = ref(false)
 
-const GROUP_ORDER = ['Overview', 'Registration', 'Data', 'Settings']
+const GROUP_ORDER = ['Overview', 'Registration', 'Data', 'Settings', 'Administration']
 const groups = computed(() => {
   const map = {}
   for (const r of router.getRoutes()) {
-    if (!r.meta?.title) continue
+    if (!r.meta?.title || !r.meta?.requiresAuth) continue
+    if (r.meta.requiresAdmin && auth.user?.role !== 'admin') continue
     const g = r.meta.group || 'Other'
     ;(map[g] ||= []).push(r)
   }
@@ -33,7 +36,7 @@ const crumb = computed(() => [route.meta.group, route.meta.title].filter(Boolean
 
 const menuOptions = computed(() =>
   router.getRoutes()
-    .filter((r) => r.meta?.title)
+    .filter((r) => r.meta?.title && r.meta?.requiresAuth && (!r.meta.requiresAdmin || auth.user?.role === 'admin'))
     .map((r) => ({ value: r.path, label: `${r.meta.group} / ${r.meta.title}` })),
 )
 const search = ref('')
@@ -52,9 +55,26 @@ const statPills = computed(() => [
 
 onMounted(() => {
   theme.apply()
+  if (!auth.user) return
   statsStore.startPolling()
   runtime.connectAutoStream()
 })
+
+onUnmounted(() => {
+  // The layout owns the authenticated tenant's background work. Stop it as
+  // soon as the session leaves the protected shell so a public route never
+  // keeps polling or reconnecting with the previous tenant's credentials.
+  statsStore.stopPolling()
+  runtime.disconnectStreams()
+})
+
+async function signOut() {
+  await auth.logout()
+  await router.replace('/login')
+  // Recreate every Pinia store so tenant-scoped form and proxy state from the
+  // previous user cannot remain in memory for the next login.
+  window.location.reload()
+}
 </script>
 <template>
   <el-container class="admin">
@@ -105,7 +125,7 @@ onMounted(() => {
           <el-dropdown>
             <span class="avatar">
               <el-avatar :size="28" class="avatar-img"><el-icon><User /></el-icon></el-avatar>
-              <span class="avatar-name">Administrator</span>
+              <span class="avatar-name">{{ auth.user?.username || 'User' }}</span>
               <el-icon :size="12"><ArrowDown /></el-icon>
             </span>
             <template #dropdown>
@@ -113,6 +133,7 @@ onMounted(() => {
                 <el-dropdown-item @click="theme.toggle">
                   {{ theme.dark ? 'Light mode' : 'Dark mode' }}
                 </el-dropdown-item>
+                <el-dropdown-item divided @click="signOut">Sign out</el-dropdown-item>
               </el-dropdown-menu>
             </template>
           </el-dropdown>
@@ -135,11 +156,7 @@ onMounted(() => {
           v-if="banner" :title="banner" type="error" show-icon
           class="circuit-banner" @close="runtime.dismissBanner"
         />
-        <router-view v-slot="{ Component }">
-          <keep-alive>
-            <component :is="Component" />
-          </keep-alive>
-        </router-view>
+        <keep-alive><slot /></keep-alive>
       </el-main>
     </el-container>
   </el-container>

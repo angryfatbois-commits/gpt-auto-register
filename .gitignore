@@ -4,6 +4,11 @@ webui/webui.db
 webui/webui.db-shm
 webui/webui.db-wal
 webui/webui.db-journal
+webui/auth.db
+webui/auth.db-shm
+webui/auth.db-wal
+webui/auth.db-journal
+webui/user_data/
 webui/logs/
 # Manual database backups can contain the entire account pool and credentials.
 *.db.bak
