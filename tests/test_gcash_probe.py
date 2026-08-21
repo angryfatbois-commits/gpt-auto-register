@@ -236,6 +236,32 @@ class GCashClassificationTests(unittest.TestCase):
         self.assertEqual(result["classification"], "ineligible")
         self.assertFalse(result["method_available"])
 
+    def test_accepted_configured_gcash_id_overrides_a_nonliteral_display_label(self):
+        result = classify_gcash_evidence(
+            [{
+                "custom_payment_method_data": [{
+                    "type": "cpmt_configured_gcash",
+                    "display_name": "Localized wallet label",
+                }],
+            }],
+            trusted_custom_method_ids=["cpmt_configured_gcash"],
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["eligible"])
+        self.assertTrue(result["method_available"])
+
+    def test_nonliteral_label_without_configured_id_remains_ineligible(self):
+        result = classify_gcash_evidence([{
+            "custom_payment_method_data": [{
+                "type": "cpmt_untrusted_wallet",
+                "display_name": "Localized wallet label",
+            }],
+        }])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+
 
 class GCashNetworkProbeTests(unittest.TestCase):
     def test_missing_access_token_returns_unavailable_without_network(self):
