@@ -100,7 +100,7 @@ const router = createRouter({
 // Top progress bar for route changes.
 router.beforeEach((to, from, next) => {
   NProgress.start()
-  if (to.meta?.title) document.title = `${to.meta.title} · Outlook Register`
+  if (to.meta?.title) document.title = `${to.meta.title} · GPT Auto Register`
   const auth = useAuthStore()
   if (!auth.ready) {
     auth.load().then(() => {

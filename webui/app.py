@@ -124,7 +124,7 @@ def _sms_country_name(country_id: str) -> str:
     except (KeyError, TypeError, ValueError):
         return f"Country {country_id}" if country_id else "Unknown"
 
-app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app = FastAPI(title="GPT Auto Register WebUI", docs_url=None, redoc_url=None)
 
 
 _LOGIN_FAILURES: dict[str, list[float]] = {}

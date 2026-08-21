@@ -35,9 +35,17 @@ test('shipped production static assets contain no Han text', async () => {
 test('active shell uses the project name and has no third-party promotion banner', async () => {
   const layout = await readFile(new URL('../src/layouts/AdminLayout.vue', import.meta.url), 'utf8')
   const router = await readFile(new URL('../src/router/index.js', import.meta.url), 'utf8')
+  const prohibitedBranding = /Community QQ|Recommended hosting|Ransuyun|ad-banner|adDismissed/i
 
   assert.match(layout, /GPT Auto Register/)
-  assert.doesNotMatch(layout, /Community QQ|Recommended hosting|Ransuyun|ad-banner|adDismissed/i)
+  assert.doesNotMatch(layout, prohibitedBranding)
   assert.match(router, /· GPT Auto Register/)
   assert.doesNotMatch(router, /· Outlook Register/)
+
+  const staticFiles = await listFiles(new URL('../../static/', import.meta.url))
+  for (const file of staticFiles.filter((item) => /\.(?:css|html|js)$/i.test(item.pathname))) {
+    const content = await readFile(file, 'utf8')
+    assert.doesNotMatch(content, prohibitedBranding, file.pathname)
+    assert.doesNotMatch(content, /Outlook Register/, file.pathname)
+  }
 })

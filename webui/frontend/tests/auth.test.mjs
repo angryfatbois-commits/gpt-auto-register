@@ -42,3 +42,34 @@ test('legacy browser state can be claimed by only one administrator', async () =
   assert.equal(values.get(tenantStorageKey('legacy-settings', alice.id)), '{"proxy":"old"}')
   assert.equal(readTenantStorage(storage, 'legacy-settings', bob), null)
 })
+
+test('tenant browser storage fails closed for missing identities and storage errors', async () => {
+  const { readTenantStorage, tenantStorageKey } = await import('../src/stores/tenant-storage.js')
+  const alice = { id: 'alice-id', role: 'admin' }
+
+  assert.equal(tenantStorageKey('settings', ''), 'settings:anonymous')
+  assert.equal(readTenantStorage(null, 'settings', alice), null)
+  assert.equal(readTenantStorage({ getItem: () => null }, 'settings', null), null)
+
+  const existing = new Map([[tenantStorageKey('settings', alice.id), 'tenant-value']])
+  const existingStorage = {
+    getItem: (key) => existing.has(key) ? existing.get(key) : null,
+    setItem: (key, value) => existing.set(key, String(value)),
+  }
+  assert.equal(readTenantStorage(existingStorage, 'settings', alice), 'tenant-value')
+  assert.equal(readTenantStorage(existingStorage, 'missing', { id: 'user-id', role: 'user' }), null)
+  assert.equal(readTenantStorage(existingStorage, 'missing', alice), null)
+
+  const sameOwner = new Map([
+    ['legacy-settings', 'legacy-value'],
+    ['legacy-settings:legacy-owner', alice.id],
+  ])
+  const sameOwnerStorage = {
+    getItem: (key) => sameOwner.has(key) ? sameOwner.get(key) : null,
+    setItem: (key, value) => sameOwner.set(key, String(value)),
+  }
+  assert.equal(readTenantStorage(sameOwnerStorage, 'legacy-settings', alice), 'legacy-value')
+
+  const brokenStorage = { getItem: () => { throw new Error('storage unavailable') } }
+  assert.equal(readTenantStorage(brokenStorage, 'settings', alice), null)
+})

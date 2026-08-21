@@ -17,7 +17,6 @@ const { stats } = storeToRefs(statsStore)
 const { banner } = storeToRefs(runtime)
 
 const collapse = ref(false)
-const adDismissed = ref(false)
 
 const GROUP_ORDER = ['Overview', 'Registration', 'Data', 'Settings', 'Administration']
 const groups = computed(() => {
@@ -81,7 +80,7 @@ async function signOut() {
     <el-aside :width="collapse ? '64px' : '220px'" class="sidebar">
       <div class="brand" :class="{ mini: collapse }">
         <span class="logo"><el-icon :size="18"><Platform /></el-icon></span>
-        <span v-if="!collapse" class="brand-name">Outlook Register</span>
+        <span v-if="!collapse" class="brand-name">GPT Auto Register</span>
       </div>
       <el-scrollbar>
         <el-menu :default-active="activeMenu" router :collapse="collapse" class="side-menu">
@@ -141,17 +140,6 @@ async function signOut() {
       </el-header>
 
       <el-main class="content">
-        <div v-if="!adDismissed" class="ad-banner">
-          <div class="ad-content">
-            <el-icon :size="16" style="color: #e6a23c; flex-shrink: 0"><Bell /></el-icon>
-            <span>Community QQ group: <b>259844673</b></span>
-            <span class="ad-sep">|</span>
-            <span>Recommended hosting: <a href="http://www.ransuyun.com" target="_blank" rel="noopener">Ransuyun</a></span>
-          </div>
-          <el-button text size="small" class="ad-close" @click="adDismissed = true">
-            <el-icon :size="14"><Close /></el-icon>
-          </el-button>
-        </div>
         <el-alert
           v-if="banner" :title="banner" type="error" show-icon
           class="circuit-banner" @close="runtime.dismissBanner"
@@ -215,37 +203,6 @@ async function signOut() {
 .avatar-name { font-size: 13px; color: var(--el-text-color-regular); }
 .content { background: var(--app-content-bg); padding: 16px; }
 .circuit-banner { margin-bottom: 14px; }
-.ad-banner {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  padding: 8px 14px;
-  margin-bottom: 14px;
-  border-radius: 6px;
-  background: linear-gradient(135deg, #fff7e6 0%, #fff1d6 100%);
-  border: 1px solid #ffd88a;
-  font-size: 13px;
-  color: #6b5900;
-}
-:root.dark .ad-banner {
-  background: linear-gradient(135deg, #2a2517 0%, #302818 100%);
-  border-color: #5c4a1e;
-  color: #d4b96a;
-}
-.ad-content {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-.ad-content a {
-  color: var(--brand);
-  text-decoration: none;
-  font-weight: 600;
-}
-.ad-content a:hover { text-decoration: underline; }
-.ad-sep { color: #c0a050; margin: 0 2px; }
-.ad-close { flex-shrink: 0; color: #a08040; }
 @media (max-width: 768px) {
   .pills, .search-box, .avatar-name { display: none; }
 }
