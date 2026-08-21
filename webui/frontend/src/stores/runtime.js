@@ -36,7 +36,8 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const dataVersion = ref(0)      // Increment to refresh pool, result, and run tables.
   const runningSingle = ref(false)
 
-  let currentEs = null
+  let manualEs = null
+  const automaticRunStreams = new Map()
   let autoEs = null
   let autoReconnectTimer = null
   let autoStreamWanted = false
@@ -49,11 +50,45 @@ export const useRuntimeStore = defineStore('runtime', () => {
   function bumpData() { dataVersion.value++ }
   function dismissBanner() { banner.value = '' }
 
-  // ─── SSE for a single registration run ───
-  function streamRun(runId) {
-    if (currentEs) { try { currentEs.close() } catch (_) {} }
-    runningSingle.value = true
-    const es = createSSE(`/api/runs/${runId}/stream`, {
+  function finalizeRunStream(runId, es, automatic) {
+    if (es.__finalized) return
+    es.__finalized = true
+    try { es.close() } catch (_) {}
+
+    if (automatic) {
+      if (automaticRunStreams.get(runId) === es) automaticRunStreams.delete(runId)
+    } else if (manualEs === es) {
+      manualEs = null
+      runningSingle.value = false
+    }
+
+    // The database write happens before the run stream ends. Reconcile both
+    // statistics and cached tables even when EventSource ended through error.
+    useStatsStore().refresh()
+    bumpData()
+  }
+
+  function openRunStream(runId, { automatic = false } = {}) {
+    const id = String(runId || '').trim()
+    if (!id) return null
+
+    if (automatic) {
+      const existing = automaticRunStreams.get(id)
+      if (existing) return existing
+    } else {
+      if (manualEs) {
+        try { manualEs.close() } catch (_) {}
+        manualEs = null
+      }
+      runningSingle.value = true
+      // A manual registration claims the mailbox before returning its run ID.
+      // Refresh now so the header immediately moves it to In progress.
+      useStatsStore().refresh()
+      bumpData()
+    }
+
+    let es = null
+    es = createSSE(`/api/runs/${id}/stream`, {
       log: (e) => {
         try {
           const d = JSON.parse(e.data)
@@ -64,11 +99,14 @@ export const useRuntimeStore = defineStore('runtime', () => {
         try {
           const d = JSON.parse(e.data)
           if (d.kind === 'done') {
-            lastRunResult.value = {
-              email: d.email,
-              password: d.password || '',
-              access_token_len: d.access_token_len,
-              partial: d.partial,
+            if (!automatic) {
+              lastRunResult.value = {
+                email: d.email,
+                password: d.password || '',
+                access_token_len: d.access_token_len,
+                totp_secret: d.totp_secret || '',
+                partial: d.partial,
+              }
             }
             addLog(
               `Registration complete: ${d.email}${d.password ? ' / ' + d.password : ''}`
@@ -76,7 +114,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
               'ok',
             )
           } else if (d.kind === 'error') {
-            lastRunResult.value = { email: d.email, error: d.message }
+            if (!automatic) lastRunResult.value = { email: d.email, error: d.message }
             addLog('Error: ' + d.message, 'err')
           } else if (d.kind === 'phase') {
             addLog(`phase=${d.phase} email=${d.email}`, 'evt')
@@ -84,18 +122,27 @@ export const useRuntimeStore = defineStore('runtime', () => {
         } catch (_) {}
       },
       end: () => {
-        try { es.close() } catch (_) {}
-        currentEs = null
-        runningSingle.value = false
-        useStatsStore().refresh()
-        bumpData()
+        finalizeRunStream(id, es, automatic)
       },
     }, () => {
-      try { es.close() } catch (_) {}
-      currentEs = null
-      runningSingle.value = false
+      finalizeRunStream(id, es, automatic)
     })
-    currentEs = es
+
+    if (automatic) automaticRunStreams.set(id, es)
+    else manualEs = es
+    return es
+  }
+
+  // ─── SSE for a registration run started manually ───
+  function streamRun(runId) {
+    return openRunStream(runId)
+  }
+
+  // Automatic workers need independent streams. A map prevents one concurrent
+  // worker from closing another worker's live logs and also deduplicates replayed
+  // state after the global automatic stream reconnects.
+  function streamAutomaticRun(runId) {
+    return openRunStream(runId, { automatic: true })
   }
 
   // ─── Global automatic-run SSE, connected at startup with automatic reconnect ───
@@ -108,13 +155,25 @@ export const useRuntimeStore = defineStore('runtime', () => {
     if (autoEs) { try { autoEs.close() } catch (_) {} }
     const es = createSSE('/api/auto/stream', {
       state: (e) => {
-        try { autoStatus.value = JSON.parse(e.data) } catch (_) {}
+        try {
+          const next = JSON.parse(e.data)
+          autoStatus.value = next
+
+          const statsStore = useStatsStore()
+          if (next.pool_stats && statsStore.applySnapshot(next.pool_stats)) bumpData()
+
+          // The initial snapshot and every reconnect include active workers.
+          // Recover streams whose run_started event happened before subscription.
+          for (const worker of Array.isArray(next.workers) ? next.workers : []) {
+            if (worker?.run_id) streamAutomaticRun(worker.run_id)
+          }
+        } catch (_) {}
       },
       run_started: (e) => {
         try {
           const d = JSON.parse(e.data)
           addLog(`[auto] Registration started for ${d.email} (run=${d.run_id})`, 'evt')
-          streamRun(d.run_id) // Reuse the single-run SSE to stream this run's logs.
+          streamAutomaticRun(d.run_id)
         } catch (_) {}
       },
       run_finished: (e) => {
@@ -155,10 +214,14 @@ export const useRuntimeStore = defineStore('runtime', () => {
       clearTimeout(autoReconnectTimer)
       autoReconnectTimer = null
     }
-    if (currentEs) {
-      try { currentEs.close() } catch (_) {}
-      currentEs = null
+    if (manualEs) {
+      try { manualEs.close() } catch (_) {}
+      manualEs = null
     }
+    for (const es of automaticRunStreams.values()) {
+      try { es.close() } catch (_) {}
+    }
+    automaticRunStreams.clear()
     if (autoEs) {
       try { autoEs.close() } catch (_) {}
       autoEs = null
