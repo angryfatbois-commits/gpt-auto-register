@@ -33,6 +33,7 @@ automated browser contract.
 | 4 | ChatGPT JSON POSTs use a one-shot curl transport that does not inherit a session cookie jar | `test_isolated_post_matches_tls_profile_and_keeps_proxy` | Transport regression | PASS |
 | 5 | SOCKS DNS continues through the proxy and neither checkout attempt invokes confirmation, custom-method start, or payment execution | Both targets plus the GCash regression suite | Privacy/security regression | PASS |
 | 6 | Access tokens, cookies, proxy credentials, checkout IDs, and the browser session ID are not returned in the eligibility result | GCash network-probe security tests | Data-exposure regression | PASS |
+| 7 | Recognized HTTP 400/422 messages become stable allowlisted codes while unknown messages stay generic and no body text is returned | `test_checkout_400_reason_is_reduced_to_a_safe_stable_code` | Diagnostic/security regression | PASS |
 
 ## Coverage and known gaps
 
@@ -51,3 +52,4 @@ once from the WebUI to validate the upstream behavior.
 
 - RED checkpoint: `277daa9` (`test: cover browser-compatible gcash checkout transport`)
 - GREEN checkpoint: `9edb108` (`fix: align gcash checkout browser transport`)
+- Diagnostic RED checkpoint: `57ce5fe` (`test: classify safe gcash checkout rejection reasons`)

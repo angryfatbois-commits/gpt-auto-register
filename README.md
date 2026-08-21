@@ -259,6 +259,13 @@ fields; promotion remains a best-effort update after checkout creation. A
 recognized billing-country mismatch is never retried, and neither path calls
 confirmation or payment-execution endpoints.
 
+For troubleshooting, a small allowlist converts recognizable upstream 400/422
+messages into stable codes such as `checkout_already_paid`,
+`checkout_account_invalid`, `checkout_session_invalid`,
+`checkout_billing_country_mismatch`, or `checkout_promotion_rejected`. Any
+unrecognized response remains a generic `checkout_http_*` code; the response
+body is never returned or persisted.
+
 ## Stored Results
 
 Eligibility data is stored inside the existing `registered.extra_json` field:
