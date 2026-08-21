@@ -31,3 +31,13 @@ test('shipped production static assets contain no Han text', async () => {
     assert.doesNotMatch(content, HAN_TEXT, file.pathname)
   }
 })
+
+test('active shell uses the project name and has no third-party promotion banner', async () => {
+  const layout = await readFile(new URL('../src/layouts/AdminLayout.vue', import.meta.url), 'utf8')
+  const router = await readFile(new URL('../src/router/index.js', import.meta.url), 'utf8')
+
+  assert.match(layout, /GPT Auto Register/)
+  assert.doesNotMatch(layout, /Community QQ|Recommended hosting|Ransuyun|ad-banner|adDismissed/i)
+  assert.match(router, /· GPT Auto Register/)
+  assert.doesNotMatch(router, /· Outlook Register/)
+})
