@@ -35,11 +35,12 @@ _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
 )
+_FIREFOX_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
+    "Gecko/20100101 Firefox/144.0"
+)
 _STRIPE_USER_AGENTS = {
-    "firefox144": (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
-        "Gecko/20100101 Firefox/144.0"
-    ),
+    "firefox144": _FIREFOX_USER_AGENT,
     "chrome110": (
         "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
         "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -737,6 +738,19 @@ def _checkout_session(payload: Mapping[str, Any]) -> tuple[str, str]:
     return session_id, processor
 
 
+def _method_only_checkout_payload() -> dict[str, Any]:
+    """Build the browser-compatible PH/PHP checkout needed to list methods."""
+    return {
+        "entry_point": "all_plans_pricing_modal",
+        "plan_name": "chatgptplusplan",
+        "billing_details": {
+            "country": GCASH_CHECKOUT_COUNTRY,
+            "currency": GCASH_CHECKOUT_CURRENCY,
+        },
+        "checkout_ui_mode": "custom",
+    }
+
+
 def _checkout_payload(*, promo_campaign_id: str = PROMOTION_ID) -> dict[str, Any]:
     """Build the Philippines Checkout contract used by the source workflow.
 
@@ -746,13 +760,7 @@ def _checkout_payload(*, promo_campaign_id: str = PROMOTION_ID) -> dict[str, Any
     does not silently report a different country's method set.
     """
     return {
-        "entry_point": "all_plans_pricing_modal",
-        "plan_name": "chatgptplusplan",
-        "billing_details": {
-            "country": GCASH_CHECKOUT_COUNTRY,
-            "currency": GCASH_CHECKOUT_CURRENCY,
-        },
-        "checkout_ui_mode": "custom",
+        **_method_only_checkout_payload(),
         "promo_campaign": {
             "promo_campaign_id": str(promo_campaign_id or PROMOTION_ID).strip(),
             "is_coupon_from_query_param": False,
@@ -1009,20 +1017,54 @@ def probe_gcash(
         )
         checkout_route = "/backend-api/payments/checkout"
         stage = "checkout"
-        checkout = _post_json(
-            session,
-            f"{CHATGPT_PAYMENTS_BASE}/checkout",
-            _checkout_payload(),
-            _chatgpt_headers(
-                token,
-                account_id=account_id,
-                device_id=stable_device_id,
-                cookie_header=cookie_header,
-                route=checkout_route,
-            ),
-            timeout,
-            stage,
+        checkout_headers = _chatgpt_headers(
+            token,
+            account_id=account_id,
+            device_id=stable_device_id,
+            cookie_header=cookie_header,
+            route=checkout_route,
         )
+        try:
+            checkout = _post_json(
+                session,
+                f"{CHATGPT_PAYMENTS_BASE}/checkout",
+                _checkout_payload(),
+                checkout_headers,
+                timeout,
+                stage,
+            )
+        except _ProbeFailure as exc:
+            # The source repository also has a base checkout contract that
+            # omits optional promotion/card-proxy fields and applies promotion
+            # later. Some otherwise valid accounts reject the richer create
+            # payload with a generic 400/422 even though their browser checkout
+            # exposes GCash. Retry that exact compatibility shape once with a
+            # fresh fingerprint. Never retry a known country mismatch, never
+            # remove PH/PHP, and never fall back outside the selected proxy.
+            if exc.code not in {"checkout_http_400", "checkout_http_422"}:
+                raise
+            _LOGGER.info(
+                "[gcash_probe] checkout compatibility retry reason=%s",
+                exc.code,
+            )
+            try:
+                session.close()
+            except Exception:
+                pass
+            session = session_factory(
+                proxy=str(proxy or "").strip() or None,
+                impersonate="firefox144",
+            )
+            compatibility_headers = dict(checkout_headers)
+            compatibility_headers["User-Agent"] = _FIREFOX_USER_AGENT
+            checkout = _post_json(
+                session,
+                f"{CHATGPT_PAYMENTS_BASE}/checkout",
+                _method_only_checkout_payload(),
+                compatibility_headers,
+                timeout,
+                stage,
+            )
         checkout_session_id, processor = _checkout_session(checkout)
         payloads: list[Mapping[str, Any]] = [checkout]
 

@@ -297,6 +297,79 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(result["decision"], "checkout_session_invalid")
         self.assertEqual(len(session.calls), 1)
 
+    def test_generic_checkout_http_400_retries_with_a_minimal_ph_contract(self):
+        """A rejected optional promo payload must not hide a browser-visible method."""
+        method_id = "cpmt_checkout_compatibility_retry"
+        rejected_checkout = FakeSession([
+            FakeResponse({"detail": "request rejected"}, status_code=400),
+        ])
+        recovered_checkout = FakeSession([
+            FakeResponse({
+                "checkout_session_id": "cs_test_checkout_compatibility_retry",
+                "processor_entity": "openai_ie",
+                "publishable_key": "pk_test_checkout_compatibility_retry",
+                "customer_session_client_secret": "cuss_checkout_compatibility_retry",
+                "billing_details": {"country": "PH", "currency": "PHP"},
+                "custom_payment_methods": [method_id],
+            }),
+            FakeResponse({
+                "billing_details": {"country": "PH", "currency": "PHP"},
+                "custom_payment_methods": [method_id],
+            }),
+        ])
+        stripe = FakeSession([
+            FakeResponse({
+                "merchant_country": "PH",
+                "merchant_currency": "php",
+                "custom_payment_method_data": [{
+                    "type": method_id,
+                    "display_name": "Localized wallet label",
+                }],
+            }),
+        ])
+        sessions = [rejected_checkout, recovered_checkout, stripe]
+        factories = []
+
+        def factory(**kwargs):
+            factories.append(kwargs)
+            return sessions.pop(0)
+
+        result = probe_gcash(
+            "access-token",
+            proxy="http://ph-proxy.example:8080",
+            session_factory=factory,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertTrue(result["method_available"])
+        self.assertEqual(
+            [item["impersonate"] for item in factories[:2]],
+            ["chrome110", "firefox144"],
+        )
+        self.assertEqual(
+            [item["proxy"] for item in factories[:2]],
+            ["http://ph-proxy.example:8080", "http://ph-proxy.example:8080"],
+        )
+        self.assertTrue(rejected_checkout.closed)
+        retry_payload = recovered_checkout.calls[0][2]["json"]
+        retry_headers = recovered_checkout.calls[0][2]["headers"]
+        self.assertIn("Firefox/144.0", retry_headers["User-Agent"])
+        self.assertEqual(
+            retry_payload["billing_details"],
+            {"country": "PH", "currency": "PHP"},
+        )
+        self.assertNotIn("promo_campaign", retry_payload)
+        self.assertNotIn("check_card_proxy", retry_payload)
+        all_urls = [
+            url
+            for session in (rejected_checkout, recovered_checkout, stripe)
+            for _, url, _ in session.calls
+        ]
+        self.assertFalse(any(
+            "confirm" in url or "custom_payment_method/start" in url
+            for url in all_urls
+        ))
+
     def test_opaque_custom_method_id_is_discovered_then_verified_by_stripe(self):
         checkout = {
             "checkout_session_id": "cs_test_dynamic_method",

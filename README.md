@@ -243,6 +243,13 @@ one bounded retry on transport-only failures. Proxy credentials, access
 tokens, cookies, checkout session IDs, customer secrets, and raw upstream
 bodies are excluded from stored eligibility results.
 
+If the source-compatible checkout create payload receives a generic HTTP
+400/422, the probe makes one bounded compatibility attempt with a fresh browser
+session. That attempt keeps the same selected proxy and PH/PHP region but omits
+the optional promotion and card-proxy fields; promotion remains a best-effort
+update after checkout creation. A recognized billing-country mismatch is never
+retried, and neither path calls confirmation or payment-execution endpoints.
+
 ## Stored Results
 
 Eligibility data is stored inside the existing `registered.extra_json` field:
