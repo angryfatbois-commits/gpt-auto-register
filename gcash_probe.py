@@ -302,6 +302,9 @@ def _inspect_method(value: Any) -> tuple[bool, list[str], list[str]]:
 
     for name, item in value.items():
         name_key = _key(name)
+        if isinstance(item, str):
+            if custom_id := _custom_method_id(item):
+                custom_ids.append(custom_id)
         if name_key in _IDENTIFIER_KEYS:
             identifier = str(item or "").strip()
             if custom_id := _custom_method_id(identifier):
@@ -348,8 +351,17 @@ def _has_non_gcash_label(value: Any) -> bool:
     return False
 
 
-def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
+def _evidence(
+    payloads: Iterable[Any],
+    *,
+    trusted_custom_method_ids: Iterable[str] = (),
+) -> dict[str, Any]:
     """Extract method evidence and retain amount/currency for diagnostics."""
+    trusted_ids = {
+        method_id
+        for value in trusted_custom_method_ids
+        if (method_id := _custom_method_id(value))
+    }
     method_present = False
     explicit_method_collection = False
     custom_candidate_present = False
@@ -443,7 +455,8 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
                 if amount is not None:
                     amounts.add(amount)
 
-    if method_present:
+    trusted_custom_method_matched = bool(trusted_ids.intersection(custom_ids))
+    if method_present or trusted_custom_method_matched:
         method_available: bool | None = True
     elif custom_candidate_ids - custom_non_gcash_ids:
         # A response may describe more than one custom method. A negative
@@ -464,6 +477,7 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
         "method_evidence_present": explicit_method_collection,
         "custom_candidate_present": custom_candidate_present,
         "custom_non_gcash_present": custom_non_gcash_present,
+        "trusted_custom_method_matched": trusted_custom_method_matched,
         "custom_method_ids": list(dict.fromkeys(custom_ids)),
         "method_tokens": list(dict.fromkeys(method_tokens)),
         "amounts": amounts,
@@ -477,6 +491,7 @@ def classify_gcash_evidence(
     *,
     require_zero: bool = True,
     checked_at: float | None = None,
+    trusted_custom_method_ids: Iterable[str] = (),
 ) -> dict[str, Any]:
     """Return a method-only availability result from checkout evidence.
 
@@ -485,7 +500,10 @@ def classify_gcash_evidence(
     conclusive ineligible result under the requested binary policy.
     """
     del require_zero
-    evidence = _evidence(payloads)
+    evidence = _evidence(
+        payloads,
+        trusted_custom_method_ids=trusted_custom_method_ids,
+    )
     method = evidence["method_available"]
     amounts = evidence["amounts"]
     currencies = evidence["currencies"]
@@ -508,6 +526,9 @@ def classify_gcash_evidence(
         "method_available": method,
         "method_evidence_present": bool(evidence["method_evidence_present"]),
         "custom_method_id_discovered": bool(evidence["custom_method_ids"]),
+        "trusted_custom_method_matched": bool(
+            evidence["trusted_custom_method_matched"]
+        ),
         "amount_minor": amount,
         "currency": currency,
         "checkout_country": country,
@@ -932,6 +953,7 @@ def probe_gcash(
     session = None
     stage = "session"
     optional_failures: list[_ProbeFailure] = []
+    trusted_custom_method_matches: list[str] = []
     try:
         session = session_factory(
             proxy=str(proxy or "").strip() or None,
@@ -1087,6 +1109,9 @@ def probe_gcash(
                         timeout=timeout,
                         stage=stage,
                     )
+                    stripe_custom_ids = _evidence([stripe])["custom_method_ids"]
+                    if configured_id and configured_id in stripe_custom_ids:
+                        trusted_custom_method_matches.append(configured_id)
                     payloads.append(stripe)
                 except _ProbeFailure as exc:
                     optional_failures.append(exc)
@@ -1115,6 +1140,7 @@ def probe_gcash(
             payloads,
             require_zero=require_zero,
             checked_at=checked_at,
+            trusted_custom_method_ids=trusted_custom_method_matches,
         )
     except _ProbeFailure as exc:
         if exc.status_code in {400, 422}:
