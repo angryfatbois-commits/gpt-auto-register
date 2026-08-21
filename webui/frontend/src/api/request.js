@@ -14,6 +14,20 @@ const http = axios.create({
   timeout: 60000,
 })
 
+function csrfToken() {
+  if (typeof document === 'undefined') return ''
+  const item = document.cookie.split('; ').find((part) => part.startsWith('webui_csrf='))
+  return item ? decodeURIComponent(item.slice('webui_csrf='.length)) : ''
+}
+
+http.interceptors.request.use((config) => {
+  if (['post', 'put', 'patch', 'delete'].includes(String(config.method || '').toLowerCase())) {
+    const token = csrfToken()
+    if (token) config.headers['X-CSRF-Token'] = token
+  }
+  return config
+})
+
 // Normalize response bodies and error messages. Backend contract:
 //   - General errors: non-2xx response with a detail field in the body.
 //   - Validation errors (such as per-line import errors): 422 with
@@ -48,7 +62,7 @@ export default http
  * @returns {EventSource}
  */
 export function createSSE(path, handlers = {}, onError) {
-  const es = new EventSource(API_BASE + path)
+  const es = new EventSource(API_BASE + path, { withCredentials: true })
   for (const [event, cb] of Object.entries(handlers)) {
     es.addEventListener(event, cb)
   }

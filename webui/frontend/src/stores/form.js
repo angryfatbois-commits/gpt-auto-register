@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia'
 import { reactive, watch } from 'vue'
+import { useAuthStore } from './auth'
+import { readTenantStorage, tenantStorageKey } from './tenant-storage'
 
-const KEY = 'gpt_outlook_register_form_v2'
+const BASE_KEY = 'gpt_outlook_register_form_v2'
 
 // Form fields shared across pages and persisted in localStorage.
 // The proxy value is shared by registration, automatic runs, and Plus eligibility checks.
@@ -27,8 +29,12 @@ export function proxyText(form) {
 }
 
 export const useFormStore = defineStore('form', () => {
+  const auth = useAuthStore()
+  const key = tenantStorageKey(BASE_KEY, auth.user?.id)
   let saved = {}
-  try { saved = JSON.parse(localStorage.getItem(KEY) || '{}') } catch (_) { saved = {} }
+  try {
+    saved = JSON.parse(readTenantStorage(localStorage, BASE_KEY, auth.user) || '{}')
+  } catch (_) { saved = {} }
   const form = reactive({ ...defaults, ...saved })
 
   // Normalize cleared or persisted nullish proxy values to an empty string.
@@ -37,7 +43,7 @@ export const useFormStore = defineStore('form', () => {
   })
 
   watch(form, (v) => {
-    try { localStorage.setItem(KEY, JSON.stringify(v)) } catch (_) {}
+    try { localStorage.setItem(key, JSON.stringify(v)) } catch (_) {}
   }, { deep: true })
 
   return { form }

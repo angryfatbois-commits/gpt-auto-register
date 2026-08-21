@@ -1,7 +1,9 @@
 import { defineStore } from 'pinia'
 import { computed, ref, watch } from 'vue'
+import { useAuthStore } from './auth'
+import { readTenantStorage, tenantStorageKey } from './tenant-storage'
 
-const KEY = 'dango_proxy_pool_v1'
+const BASE_KEY = 'dango_proxy_pool_v1'
 const OLD_FORM_KEY = 'gpt_outlook_register_form_v2'
 
 function parseLines(s) {
@@ -14,12 +16,16 @@ function dedup(arr) {
 // Independently managed proxy list persisted in localStorage.
 // Automatic runs rotate proxies by worker order via /api/auto/start proxy_pool.
 export const useProxyStore = defineStore('proxy', () => {
+  const auth = useAuthStore()
+  const key = tenantStorageKey(BASE_KEY, auth.user?.id)
   let saved = []
-  try { saved = JSON.parse(localStorage.getItem(KEY) || '[]') } catch (_) { saved = [] }
+  try {
+    saved = JSON.parse(readTenantStorage(localStorage, BASE_KEY, auth.user) || '[]')
+  } catch (_) { saved = [] }
   // Migrate the legacy Automatic Batch page's autoProxyPool textarea once.
   if (!saved.length) {
     try {
-      const old = JSON.parse(localStorage.getItem(OLD_FORM_KEY) || '{}')
+      const old = JSON.parse(readTenantStorage(localStorage, OLD_FORM_KEY, auth.user) || '{}')
       if (old.autoProxyPool) saved = dedup(parseLines(old.autoProxyPool))
     } catch (_) { /* ignore */ }
   }
@@ -29,7 +35,7 @@ export const useProxyStore = defineStore('proxy', () => {
   const count = computed(() => list.value.length)
 
   watch(list, (v) => {
-    try { localStorage.setItem(KEY, JSON.stringify(v)) } catch (_) {}
+    try { localStorage.setItem(key, JSON.stringify(v)) } catch (_) {}
   }, { deep: true })
 
   /** Replace the pool from a block of text and deduplicate it. Returns counts for feedback. */

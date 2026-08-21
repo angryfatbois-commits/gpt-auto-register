@@ -15,10 +15,12 @@ import logging
 import os
 import secrets
 import sys
+import threading
 import time
 import uuid
 from pathlib import Path
 from typing import Annotated, Optional
+from urllib.parse import urlsplit
 
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
@@ -28,8 +30,8 @@ from pydantic import BaseModel, Field
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from . import db, export_formats, registrar  # noqa: E402
-from .auto_loop import CONTROLLER as AUTO_LOOP  # noqa: E402
+from . import auth, db, export_formats, registrar  # noqa: E402
+from .auto_loop import get_controller  # noqa: E402
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
 from eligibility import (  # noqa: E402
     parse_plus_eligibility,
@@ -50,15 +52,23 @@ from mail_providers import (  # noqa: E402
     list_providers,
 )
 
-# Release accounts left in `in_use` by a crashed or forcibly stopped process.
+# Initialize authentication first, then recover stale claims independently for
+# every tenant database. The legacy database remains untouched until the first
+# administrator is explicitly bootstrapped and adopts it via SQLite backup.
 try:
-    _released = db.release_stale_in_use(stale_seconds=1800)
-    if _released > 0:
-        logging.getLogger("webui").info(
-            f"[startup] Released {_released} stale account(s) from in_use"
-        )
+    auth.init_auth_db()
+    auth.cleanup_expired_sessions()
+    for _tenant in auth.list_users():
+        with db.use_database_path(_tenant["db_path"]):
+            _released = db.release_stale_in_use(stale_seconds=1800)
+            if _released > 0:
+                logging.getLogger("webui").info(
+                    "[startup] Released %s stale account(s) for user_id=%s",
+                    _released,
+                    _tenant["id"],
+                )
 except Exception as _e:
-    logging.getLogger("webui").warning(f"[startup] Failed to release stale accounts: {_e}")
+    logging.getLogger("webui").warning("[startup] Auth/database initialization failed: %s", _e)
 
 logging.basicConfig(
     level=logging.INFO,
@@ -114,7 +124,176 @@ def _sms_country_name(country_id: str) -> str:
     except (KeyError, TypeError, ValueError):
         return f"Country {country_id}" if country_id else "Unknown"
 
-app = FastAPI(title="GPT Outlook Register WebUI", docs_url=None, redoc_url=None)
+app = FastAPI(title="GPT Auto Register WebUI", docs_url=None, redoc_url=None)
+
+
+_LOGIN_FAILURES: dict[str, list[float]] = {}
+_LOGIN_FAILURES_LOCK = threading.Lock()
+_LOGIN_WINDOW_SECONDS = 300
+_LOGIN_MAX_FAILURES = 10
+
+
+def _is_loopback(request: Request) -> bool:
+    host = getattr(getattr(request, "client", None), "host", None) or ""
+    try:
+        client_is_loopback = ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        client_is_loopback = host in {"localhost", "testclient"}
+    page_host = (request.url.hostname or "").lower()
+    try:
+        page_is_loopback = ipaddress.ip_address(page_host).is_loopback
+    except ValueError:
+        page_is_loopback = page_host in {"localhost", "testserver"}
+    return client_is_loopback and page_is_loopback
+
+
+def _is_same_origin_request(request: Request) -> bool:
+    """Reject browser-originated setup requests from another site."""
+    origin = request.headers.get("origin", "").strip()
+    if not origin:
+        # Command-line clients do not send Origin. Modern browsers send
+        # Sec-Fetch-Site even in cases where Origin is omitted.
+        return request.headers.get("sec-fetch-site", "").strip().lower() != "cross-site"
+    try:
+        supplied = urlsplit(origin)
+        current = urlsplit(str(request.url))
+
+        def normalized_port(parts) -> int | None:
+            if parts.port is not None:
+                return parts.port
+            return 443 if parts.scheme.lower() == "https" else 80 if parts.scheme.lower() == "http" else None
+
+        return (
+            supplied.scheme.lower(),
+            (supplied.hostname or "").lower(),
+            normalized_port(supplied),
+        ) == (
+            current.scheme.lower(),
+            (current.hostname or "").lower(),
+            normalized_port(current),
+        )
+    except ValueError:
+        return False
+
+
+def _client_key(request: Request) -> str:
+    host = getattr(getattr(request, "client", None), "host", None) or "unknown"
+    return str(host)[:80]
+
+
+def _login_rate_limited(request: Request) -> bool:
+    now = time.time()
+    key = _client_key(request)
+    with _LOGIN_FAILURES_LOCK:
+        entries = [stamp for stamp in _LOGIN_FAILURES.get(key, []) if stamp > now - _LOGIN_WINDOW_SECONDS]
+        _LOGIN_FAILURES[key] = entries
+        return len(entries) >= _LOGIN_MAX_FAILURES
+
+
+def _record_login_failure(request: Request) -> None:
+    with _LOGIN_FAILURES_LOCK:
+        _LOGIN_FAILURES.setdefault(_client_key(request), []).append(time.time())
+
+
+def _clear_login_failures(request: Request) -> None:
+    with _LOGIN_FAILURES_LOCK:
+        _LOGIN_FAILURES.pop(_client_key(request), None)
+
+
+def _safe_user(user: dict | None) -> dict | None:
+    if not user:
+        return None
+    return {
+        "id": user.get("id"),
+        "username": user.get("username"),
+        "role": user.get("role"),
+        "active": bool(user.get("active")),
+        "created_at": user.get("created_at"),
+    }
+
+
+def _request_user(request: Request) -> dict | None:
+    return getattr(getattr(request, "state", None), "user", None)
+
+
+def _cookie_secure(request: Request) -> bool:
+    configured = os.getenv("GPT_WEBUI_COOKIE_SECURE", "").strip().lower()
+    if configured:
+        return configured in {"1", "true", "yes"}
+    return request.url.scheme == "https"
+
+
+def _set_auth_cookies(response, session: dict, request: Request) -> None:
+    secure = _cookie_secure(request)
+    response.set_cookie(
+        auth.SESSION_COOKIE,
+        session["token"],
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=True,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+    response.set_cookie(
+        auth.CSRF_COOKIE,
+        session["csrf"],
+        max_age=auth.SESSION_TTL_SECONDS,
+        httponly=False,
+        secure=secure,
+        samesite="strict",
+        path="/",
+    )
+
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next):
+    """Authenticate every API request and bind it to one tenant database."""
+    path = request.url.path
+    public = (
+        path in {"/", "/api/health", "/api/auth/login", "/api/auth/setup", "/api/auth/setup-status"}
+        or path.startswith("/static/")
+    )
+    token = request.cookies.get(auth.SESSION_COOKIE, "")
+    user = auth.get_user_by_session(token) if token else None
+    if path.startswith("/api/") and not public and user is None:
+        response = JSONResponse(status_code=401, content={"detail": "Authentication required"})
+        return _apply_security_headers(response)
+    if path.startswith("/api/admin/") and not auth.can_manage_users(user):
+        response = JSONResponse(status_code=403, content={"detail": "Administrator permission required"})
+        return _apply_security_headers(response)
+    if user is not None and request.method in {"POST", "PUT", "PATCH", "DELETE"} and path not in {
+        "/api/auth/login", "/api/auth/setup"
+    }:
+        csrf = request.headers.get("X-CSRF-Token", "")
+        if not auth.verify_csrf(user, csrf):
+            response = JSONResponse(status_code=403, content={"detail": "CSRF validation failed"})
+            return _apply_security_headers(response)
+
+    request.state.user = user
+    if user is None:
+        response = await call_next(request)
+    else:
+        with db.use_database_path(user["db_path"]):
+            response = await call_next(request)
+    return _apply_security_headers(response)
+
+
+def _apply_security_headers(response):
+    response.headers.setdefault("X-Content-Type-Options", "nosniff")
+    response.headers.setdefault("X-Frame-Options", "DENY")
+    response.headers.setdefault("Referrer-Policy", "same-origin")
+    response.headers.setdefault("Permissions-Policy", "camera=(), microphone=(), geolocation=()")
+    # Element Plus positions popovers with inline style attributes, so style
+    # inline remains a documented compatibility exception. Scripts never allow
+    # inline execution or eval.
+    response.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; base-uri 'self'; object-src 'none'; frame-ancestors 'none'; "
+        "script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data:; "
+        "font-src 'self' data:; connect-src 'self'; form-action 'self'",
+    )
+    response.headers.setdefault("Cache-Control", "no-store")
+    return response
 
 
 # -------------------------------- Pydantic models --------------------------------
@@ -147,12 +326,129 @@ class RegisterReq(BaseModel):
     want_2fa: bool = False
 
 
+class LoginReq(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=1, max_length=256)
+
+
+class SetupAdminReq(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=12, max_length=256)
+
+
+class CreateUserReq(BaseModel):
+    username: str = Field(..., min_length=3, max_length=64)
+    password: str = Field(..., min_length=12, max_length=256)
+    role: str = Field("user", min_length=4, max_length=5)
+
+
+class UpdateUserPasswordReq(BaseModel):
+    password: str = Field(..., min_length=12, max_length=256)
+
+
 # ──────────────────────── API ────────────────────────
+
+
+@app.get("/api/auth/setup-status")
+def api_auth_setup_status():
+    return {"ok": True, "setup_required": auth.user_count() == 0}
+
+
+@app.post("/api/auth/setup")
+def api_auth_setup(req: SetupAdminReq, request: Request):
+    if not _is_loopback(request) or not _is_same_origin_request(request):
+        raise HTTPException(403, "Initial setup is allowed only from localhost")
+    if auth.user_count() != 0:
+        raise HTTPException(409, "Initial administrator has already been configured")
+    try:
+        user = auth.create_first_admin(req.username, req.password)
+        session = auth.create_session(user["id"])
+    except auth.AuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    response = JSONResponse({"ok": True, "user": _safe_user(user)})
+    _set_auth_cookies(response, session, request)
+    return response
+
+
+@app.post("/api/auth/login")
+def api_auth_login(req: LoginReq, request: Request):
+    if _login_rate_limited(request):
+        raise HTTPException(429, "Too many login attempts; try again later")
+    user = auth.authenticate(req.username, req.password)
+    if user is None:
+        _record_login_failure(request)
+        # Avoid revealing whether the username exists.
+        raise HTTPException(401, "Invalid username or password")
+    _clear_login_failures(request)
+    session = auth.create_session(user["id"])
+    response = JSONResponse({"ok": True, "user": _safe_user(user)})
+    _set_auth_cookies(response, session, request)
+    return response
+
+
+@app.get("/api/auth/me")
+def api_auth_me(request: Request):
+    user = _request_user(request)
+    if user is None:
+        raise HTTPException(401, "Authentication required")
+    return {"ok": True, "user": _safe_user(user)}
+
+
+@app.post("/api/auth/logout")
+def api_auth_logout(request: Request):
+    auth.revoke_session(request.cookies.get(auth.SESSION_COOKIE, ""))
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(auth.SESSION_COOKIE, path="/")
+    response.delete_cookie(auth.CSRF_COOKIE, path="/")
+    return response
+
+
+@app.get("/api/admin/users")
+def api_admin_users(request: Request):
+    if not auth.can_manage_users(_request_user(request)):
+        raise HTTPException(403, "Administrator permission required")
+    return {"ok": True, "items": [_safe_user(user) for user in auth.list_users()]}
+
+
+@app.post("/api/admin/users")
+def api_admin_create_user(req: CreateUserReq, request: Request):
+    actor = _request_user(request)
+    if not auth.can_manage_users(actor):
+        raise HTTPException(403, "Administrator permission required")
+    try:
+        user = auth.create_user(req.username, req.password, role=req.role)
+    except auth.AuthError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"ok": True, "user": _safe_user(user)}
+
+
+@app.delete("/api/admin/users/{user_id}")
+def api_admin_delete_user(user_id: str, request: Request):
+    actor = _request_user(request)
+    try:
+        auth.delete_user(user_id, actor=actor or {})
+    except auth.AuthorizationError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except auth.ValidationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"ok": True}
+
+
+@app.post("/api/admin/users/{user_id}/password")
+def api_admin_reset_password(user_id: str, req: UpdateUserPasswordReq, request: Request):
+    actor = _request_user(request)
+    try:
+        auth.reset_password(user_id, req.password, actor=actor or {})
+    except auth.AuthorizationError as exc:
+        raise HTTPException(403, str(exc)) from exc
+    except auth.ValidationError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    return {"ok": True}
 
 
 @app.get("/api/health")
 def health():
-    return {"ok": True, "stats": db.stats()}
+    return {"ok": True, "auth_required": True, "users_configured": auth.user_count() > 0}
 
 
 @app.post("/api/import")
@@ -379,6 +675,9 @@ def api_register(req: RegisterReq):
 @app.get("/api/runs/{run_id}/stream")
 async def api_stream(run_id: str, request: Request):
     """Stream task logs and events over SSE."""
+    tenant_db_path = db.current_db_path()
+    if db.get_run(run_id) is None:
+        raise HTTPException(404, "run_id not found")
     q = registrar.get_run_queue(run_id)
     if q is None:
         raise HTTPException(404, "run_id not found or finished")
@@ -400,7 +699,8 @@ async def api_stream(run_id: str, request: Request):
                 else:
                     yield f"event: log\ndata: {json.dumps({'line': msg}, ensure_ascii=False)}\n\n"
         finally:
-            registrar.remove_run_queue(run_id)
+            with db.use_database_path(tenant_db_path):
+                registrar.remove_run_queue(run_id)
 
     return StreamingResponse(
         event_gen(),
@@ -1197,7 +1497,7 @@ class AutoLoopStartReq(BaseModel):
 
 @app.post("/api/auto/start")
 def api_auto_start(req: AutoLoopStartReq):
-    res = AUTO_LOOP.start(req.model_dump())
+    res = get_controller().start(req.model_dump())
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to start"))
     return res
@@ -1205,7 +1505,7 @@ def api_auto_start(req: AutoLoopStartReq):
 
 @app.post("/api/auto/pause")
 def api_auto_pause():
-    res = AUTO_LOOP.pause()
+    res = get_controller().pause()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to pause"))
     return res
@@ -1213,7 +1513,7 @@ def api_auto_pause():
 
 @app.post("/api/auto/resume")
 def api_auto_resume():
-    res = AUTO_LOOP.resume()
+    res = get_controller().resume()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to resume"))
     return res
@@ -1221,7 +1521,7 @@ def api_auto_resume():
 
 @app.post("/api/auto/stop")
 def api_auto_stop():
-    res = AUTO_LOOP.stop()
+    res = get_controller().stop()
     if not res.get("ok"):
         raise HTTPException(400, res.get("error", "Failed to stop"))
     return res
@@ -1229,13 +1529,14 @@ def api_auto_stop():
 
 @app.get("/api/auto/status")
 def api_auto_status():
-    return {"ok": True, **AUTO_LOOP.status()}
+    return {"ok": True, **get_controller().status()}
 
 
 @app.get("/api/auto/stream")
 async def api_auto_stream(request: Request):
     """Stream auto-loop state, run_started, and run_finished events over SSE."""
-    q = AUTO_LOOP.subscribe()
+    controller = get_controller()
+    q = controller.subscribe()
 
     async def gen():
         loop = asyncio.get_event_loop()
@@ -1255,7 +1556,7 @@ async def api_auto_stream(request: Request):
                 data = msg.get("data", {})
                 yield f"event: {kind}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n"
         finally:
-            AUTO_LOOP.unsubscribe(q)
+            controller.unsubscribe(q)
 
     return StreamingResponse(
         gen(),

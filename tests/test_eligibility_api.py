@@ -1,5 +1,8 @@
 import unittest
 import warnings
+import gc
+import tempfile
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -93,16 +96,37 @@ class GCashEligibilityApiTests(unittest.TestCase):
             warnings.simplefilter("ignore")
             from fastapi.testclient import TestClient
 
-        client = TestClient(app, client=("127.0.0.1", 50000))
+        from webui import auth
 
-        with patch("webui.app.db.get_registered", return_value=None):
-            response = client.post(
-                "/api/registered/check_gcash",
-                headers={
-                    "X-GCash-Probe-Confirmation": "checkout-side-effects-acknowledged"
-                },
-                json={"emails": ["person@example.com"]},
+        old_auth_db = auth.AUTH_DB_PATH
+        old_user_dir = auth.USER_DATA_DIR
+        temp = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
+        try:
+            root = Path(temp.name)
+            auth.AUTH_DB_PATH = root / "auth.db"
+            auth.USER_DATA_DIR = root / "users"
+            auth.init_auth_db()
+            auth.create_user("admin", "test-admin-password", role="admin")
+            client = TestClient(app, client=("127.0.0.1", 50000))
+            logged_in = client.post(
+                "/api/auth/login",
+                json={"username": "admin", "password": "test-admin-password"},
             )
+            csrf = logged_in.cookies[auth.CSRF_COOKIE]
+            with patch("webui.app.db.get_registered", return_value=None):
+                response = client.post(
+                    "/api/registered/check_gcash",
+                    headers={
+                        "X-CSRF-Token": csrf,
+                        "X-GCash-Probe-Confirmation": "checkout-side-effects-acknowledged",
+                    },
+                    json={"emails": ["person@example.com"]},
+                )
+        finally:
+            auth.AUTH_DB_PATH = old_auth_db
+            auth.USER_DATA_DIR = old_user_dir
+            gc.collect()
+            temp.cleanup()
 
         self.assertEqual(response.status_code, 200)
         result = response.json()["results"]["person@example.com"]

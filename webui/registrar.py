@@ -6,6 +6,7 @@ Internal implementation details.
 from __future__ import annotations
 
 import logging
+import hashlib
 import queue
 import sys
 import threading
@@ -30,7 +31,7 @@ from sms_provider import PhoneCallbackController  # noqa: E402
 from . import db  # noqa: E402
 
 # Internal implementation note.
-_run_queues: dict[str, queue.Queue] = {}
+_run_queues: dict[tuple[str, str], queue.Queue] = {}
 _lock = threading.Lock()
 
 # Internal implementation note.
@@ -48,6 +49,25 @@ LOG_DIR = Path(__file__).resolve().parent / "logs"
 LOG_DIR.mkdir(parents=True, exist_ok=True)
 
 
+def _queue_key(run_id: str, db_path: str | Path | None = None) -> tuple[str, str]:
+    selected = Path(db_path).resolve() if db_path is not None else db.current_db_path()
+    return str(selected), str(run_id)
+
+
+def _queue_for_run(run_id: str) -> queue.Queue | None:
+    queue_value = _run_queues.get(_queue_key(run_id))
+    if queue_value is not None:
+        return queue_value
+    # A provider callback may execute on a child thread where ContextVars are
+    # not inherited. Run IDs are cryptographically random and globally unique;
+    # resolving the in-memory queue here preserves tenant ownership without
+    # exposing it through the HTTP lookup API.
+    for (__, candidate_run_id), candidate_queue in list(_run_queues.items()):
+        if candidate_run_id == str(run_id):
+            return candidate_queue
+    return None
+
+
 class QueueLogHandler(logging.Handler):
     """Internal implementation details.
 
@@ -57,6 +77,7 @@ class QueueLogHandler(logging.Handler):
     def __init__(self, run_id: str, log_file: Path):
         super().__init__()
         self.run_id = run_id
+        self.queue_key = _queue_key(run_id)
         self._fh = open(log_file, "a", encoding="utf-8")
         self.setFormatter(logging.Formatter(
             "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -67,8 +88,8 @@ class QueueLogHandler(logging.Handler):
         try:
             # Internal implementation note.
             # Internal implementation note.
-            rid = getattr(_current_run, "run_id", None)
-            if rid is not None and rid != self.run_id:
+            current_key = getattr(_current_run, "queue_key", None)
+            if current_key != self.queue_key:
                 return
             # Internal implementation note.
             # Internal implementation note.
@@ -76,7 +97,7 @@ class QueueLogHandler(logging.Handler):
             msg = self.format(record)
             self._fh.write(msg + "\n")
             self._fh.flush()
-            q = _run_queues.get(self.run_id)
+            q = _run_queues.get(self.queue_key)
             if q is not None:
                 q.put(msg)
         except Exception:
@@ -93,7 +114,7 @@ class QueueLogHandler(logging.Handler):
 def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     """Internal implementation details."""
     import json as _json
-    q = _run_queues.get(run_id)
+    q = _queue_for_run(run_id)
     if q is None:
         return
     body = payload if isinstance(payload, dict) else {"message": str(payload)}
@@ -170,6 +191,7 @@ def _do_register(
     # Internal implementation note.
     # Internal implementation note.
     _current_run.run_id = run_id
+    _current_run.queue_key = _queue_key(run_id)
 
     handler = QueueLogHandler(run_id, log_file)
     handler.setLevel(logging.INFO)
@@ -494,13 +516,14 @@ def _do_register(
             handler.close()
         except Exception:
             pass
-        q = _run_queues.get(run_id)
+        q = _run_queues.get(_queue_key(run_id))
         if q is not None:
             q.put(None)  # End-of-stream sentinel.
         # Internal implementation note.
         # Internal implementation note.
         # Internal implementation note.
         _current_run.run_id = None
+        _current_run.queue_key = None
 
 
 def _try_export_to_panels(run_id: str, cred: dict) -> None:
@@ -622,19 +645,34 @@ def _build_sms_callback(run_id: str) -> Optional[PhoneCallbackController]:
         return None
 
 
+def _do_register_in_database(
+    run_id: str,
+    account: dict,
+    options: dict,
+    log_file: Path,
+    tenant_db_path: Path,
+) -> None:
+    with db.use_database_path(tenant_db_path):
+        _do_register(run_id, account, options, log_file)
+
+
 def start_registration(account: dict, options: dict) -> str:
     """Internal implementation details."""
     run_id = uuid.uuid4().hex[:12]
-    log_file = LOG_DIR / f"{run_id}.log"
+    tenant_db_path = db.current_db_path()
+    tenant_log_key = hashlib.sha256(str(tenant_db_path).encode("utf-8")).hexdigest()[:16]
+    tenant_log_dir = LOG_DIR / tenant_log_key
+    tenant_log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = tenant_log_dir / f"{run_id}.log"
     db.create_run(run_id, account["email"], str(log_file))
 
     q: queue.Queue = queue.Queue()
     with _lock:
-        _run_queues[run_id] = q
+        _run_queues[_queue_key(run_id, tenant_db_path)] = q
 
     th = threading.Thread(
-        target=_do_register,
-        args=(run_id, account, options, log_file),
+        target=_do_register_in_database,
+        args=(run_id, account, options, log_file, tenant_db_path),
         daemon=True,
         name=f"register-{run_id}",
     )
@@ -643,9 +681,9 @@ def start_registration(account: dict, options: dict) -> str:
 
 
 def get_run_queue(run_id: str) -> Optional[queue.Queue]:
-    return _run_queues.get(run_id)
+    return _run_queues.get(_queue_key(run_id))
 
 
 def remove_run_queue(run_id: str) -> None:
     with _lock:
-        _run_queues.pop(run_id, None)
+        _run_queues.pop(_queue_key(run_id), None)
