@@ -859,6 +859,26 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertTrue(result["conclusive"])
         self.assertEqual(result["decision"], "checkout_billing_country_mismatch")
 
+    def test_checkout_400_reason_is_reduced_to_a_safe_stable_code(self):
+        cases = (
+            ("User is already paid", "checkout_already_paid"),
+            ("Invalid account context", "checkout_account_invalid"),
+            ("Invalid checkout session", "checkout_session_invalid"),
+            ("Request rejected by policy", "checkout_http_400"),
+        )
+        for detail, expected in cases:
+            with self.subTest(detail=detail):
+                session = FakeSession([
+                    FakeResponse({"detail": detail}, status_code=400),
+                    FakeResponse({"detail": detail}, status_code=400),
+                ])
+                result = probe_gcash(
+                    "access-token",
+                    session_factory=lambda **_: session,
+                )
+                self.assertEqual(result["decision"], expected)
+                self.assertNotIn(detail, repr(result))
+
     def test_explicit_checkout_evidence_survives_resolve_failure(self):
         checkout = {
             "checkout_session_id": "cs_test_resolve_failure",
