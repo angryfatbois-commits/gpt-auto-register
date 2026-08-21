@@ -132,22 +132,31 @@ non-loopback address, set `GPT_AUTO_REGISTER_ADMIN_TOKEN` on the backend and
 have the trusted proxy inject the matching `X-GPT-Admin-Token` header. Never
 embed that admin token in frontend JavaScript.
 
-The probe performs only this bounded sequence:
+The probe follows the source project's GCash capability sequence, adapted
+clean-room and bounded to payment-capability stages:
 
-1. Create a minimal checkout for the ChatGPT Plus monthly plan. Billing
-   country and currency are inferred by ChatGPT from the selected proxy exit;
-   the request does not force `PH`/`PHP`.
-2. Resolve the checkout and collect payment-method evidence when available.
-3. Ask Stripe Payment Pages for capability metadata when the checkout returns
-   a publishable key.
-4. If a live custom-method ID and customer session secret are present, make the
-   optional Stripe Elements capability request.
+1. Create a Philippines/PHP Checkout for the ChatGPT Plus monthly plan with
+   the exact `plus-1-month-free` campaign and `check_card_proxy=true`. Use a
+   Philippines proxy; a mismatched egress can be rejected as a billing-country
+   mismatch.
+2. Update the same checkout session with the campaign, plan, interval, and
+   seat quantity.
+3. Synchronize taxes for the same session using the observed PH/PHP region and
+   the account email. Tax synchronization is best-effort; a rejection does not
+   erase method evidence.
+4. Resolve the same checkout session and collect payment-method evidence.
+5. Ask Stripe Payment Pages or Stripe Elements for capability metadata. A live
+   `cpmt_...` ID returned by Checkout is preferred; an ID may be supplied
+   explicitly through `GCASH_CUSTOM_PAYMENT_METHOD_ID` when the upstream only
+   returns an opaque custom-method slot.
 
-The availability probe does not send `promo_campaign`, call checkout update,
-calculate taxes, confirm checkout, start a custom payment method, or execute a
-payment. It never submits a GCash account or authorizes a charge. Creating a
-checkout is still a remote side effect, so the WebUI always requires explicit
-confirmation before it runs.
+The probe stops before checkout confirmation, custom-payment start, provider
+redirect, or payment execution. It never submits a GCash account or authorizes
+a charge. Creating and updating an ephemeral checkout are remote side effects,
+so the WebUI always requires explicit confirmation before it runs.
+
+See [GCash workflow provenance](docs/reference/source-gcash-workflow.md) for the
+source commit, clean-room boundary, endpoint map, and excluded payment stages.
 
 The decision depends only on payment-method evidence:
 
@@ -162,7 +171,7 @@ The decision depends only on payment-method evidence:
 
 Amount and currency values are retained only as diagnostics. Zero, positive,
 negative, missing, conflicting, PHP, and non-PHP values do not change the
-GCash availability result.
+GCash availability result once method evidence is present.
 
 The WebUI deliberately exposes only two account outcomes: `GCash available` or
 `GCash unavailable`. Missing credentials, authentication failures, malformed
@@ -184,11 +193,12 @@ proxy-aware result and preserves its technical decision code.
 
 ### Proxy behavior
 
-The selected proxy is used consistently for checkout and capability reads. The
-checkout country follows that egress instead of a hard-coded billing country. A failed
-proxy request does not silently fall back to a direct connection. Proxy
-credentials, access tokens, cookies, checkout session IDs, customer secrets,
-and raw upstream bodies are excluded from stored eligibility results.
+The selected proxy is used consistently for checkout, promotion update, tax
+sync, and capability reads. GCash uses the explicit PH/PHP checkout contract,
+so the proxy must exit in the Philippines; a failed or mismatched proxy request
+does not silently fall back to a direct connection. Proxy credentials, access
+tokens, cookies, checkout session IDs, customer secrets, and raw upstream
+bodies are excluded from stored eligibility results.
 
 ## Stored Results
 

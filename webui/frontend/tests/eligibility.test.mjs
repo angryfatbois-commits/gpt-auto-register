@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
+import { readFile } from 'node:fs/promises'
 
 import {
   formatGCashDetail,
@@ -78,4 +79,14 @@ test('legacy stored labels are presented as availability labels', () => {
   assert.equal(gcashDisplayLabel({ label: 'GCash eligible' }), 'GCash available')
   assert.equal(gcashDisplayLabel({ label: 'GCash ineligible' }), 'GCash unavailable')
   assert.equal(gcashDisplayLabel({ label: 'GCash status unknown' }), 'GCash unavailable')
+})
+
+test('GCash confirmation explains the source-compatible PH workflow', async () => {
+  const view = await readFile(new URL('../src/views/Registered.vue', import.meta.url), 'utf8')
+
+  assert.match(view, /PH\/PHP checkout/)
+  assert.match(view, /applies the Plus campaign/)
+  assert.match(view, /synchronizes taxes/)
+  assert.match(view, /Philippines proxy is required/)
+  assert.doesNotMatch(view, /selected proxy\/IP country/)
 })

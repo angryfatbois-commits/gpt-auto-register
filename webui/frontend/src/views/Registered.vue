@@ -99,8 +99,8 @@ async function doGCashCheck() {
   if (!emails.length) { ElMessage.info('Select at least one account'); return }
   const approved = await confirm(
     `Check GCash availability for ${emails.length} selected account(s)?\n\n` +
-    'This creates a minimal checkout using the selected proxy/IP country and reads payment-method capability metadata.\n' +
-    'Use a Philippines proxy when you want to test the PH/PHP GCash method set.\n' +
+    'This creates a PH/PHP checkout, applies the Plus campaign, synchronizes taxes, and reads payment-method capability metadata.\n' +
+    'A Philippines proxy is required because the checkout billing country is PH.\n' +
     'It never confirms the checkout, starts a custom payment method, or executes payment.',
   )
   if (!approved) return
@@ -387,7 +387,7 @@ onActivated(() => load())
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
-        <span class="hint">GCash follows the proxy exit country; use a Philippines proxy for PH/PHP methods.</span>
+        <span class="hint">GCash uses a PH/PHP checkout; select a Philippines proxy to match it.</span>
         <el-button :loading="checking" @click="doCheck('unchecked')">Check unchecked</el-button>
         <el-button :loading="checking" @click="doCheck('all')">Recheck page</el-button>
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">

@@ -143,6 +143,7 @@ class GCashEligibilityApiTests(unittest.TestCase):
         get_registered.assert_called_once_with("person@example.com")
         self.assertEqual(probe.call_args.kwargs["proxy"], "http://proxy.example:8080")
         self.assertEqual(probe.call_args.kwargs["access_token"], "access-token")
+        self.assertEqual(probe.call_args.kwargs["checkout_email"], "person@example.com")
         persist.assert_called_once_with("person@example.com", "gcash_check", probe_result)
 
     def test_missing_access_token_is_unavailable_without_calling_probe(self):

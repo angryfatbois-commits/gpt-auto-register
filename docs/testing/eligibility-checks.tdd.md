@@ -52,6 +52,15 @@ The method-only policy RED checkpoints are reachable from the active branch:
 - `d9458e9` — classifier cases for amount/currency-independent availability;
 - `f445eb1` — minimal checkout and capability transport contract.
 
+The source-workflow RED checkpoint is preserved in `31643a6`:
+
+```text
+python -m unittest tests.test_gcash_source_workflow -v
+RED: 2 failures
+- promotion/tax stages were absent from the target probe
+- configured custom-method fallback was not queried
+```
+
 ## GCash availability policy-change evidence
 
 The requested policy change was tested before and after the classifier edit:
@@ -73,18 +82,24 @@ RED: 3 failures
 ```
 
 A controlled localhost check confirmed the old `checkout_http_400` cause was a
-billing-country/request-country mismatch. After removing the hard-coded billing
-country, the same direct egress produced a checkout method list and a conclusive
-`GCash unavailable` result instead of `unknown`. No credentials or upstream
-response bodies were stored in the evidence report.
+billing-country/request-country mismatch. The source-compatible implementation
+now makes the PH/PHP contract explicit and documents the required Philippines
+egress, so a mismatched proxy is reported with a stable billing-country reason
+instead of being silently retried through a direct connection. No credentials
+or upstream response bodies were stored in the evidence report.
 
-The full backend suite then passed with 59 tests. The new cases guarantee that
+The full backend suite then passed with 62 tests. The new cases guarantee that
 the method-only decision ignores amount/currency, recognizes explicit and
 dynamic custom-method evidence, and treats absent/incomplete method evidence as
-conclusively unavailable. The checkout country follows the selected egress;
+conclusively unavailable. The GCash checkout is explicitly PH/PHP;
 transport/authentication failures are normalized to the requested binary
 `GCash unavailable` result while their technical reason codes remain available
 for diagnosis.
+
+The source-workflow regression suite additionally guarantees the ordered
+`checkout → promotion update → tax sync → resolve → Stripe capability` path,
+same-session payload binding, PH/PHP checkout contract, and the absence of
+confirmation/start/payment execution calls.
 
 ## Test specification
 
@@ -96,7 +111,7 @@ for diagnosis.
 | 4 | GCash availability depends only on payment-method evidence; amount and currency are diagnostics | `tests/test_gcash_probe.py` | Unit | PASS |
 | 5 | Explicit GCash, dynamic custom-method IDs, generic method lists, nested method objects, and missing evidence are classified safely | `tests/test_gcash_probe.py` | Unit | PASS |
 | 6 | Standard methods use Stripe Payment Pages init; live custom IDs use Stripe Elements, and no copied ID is embedded | `tests/test_gcash_probe.py` | Transport contract | PASS |
-| 7 | The probe calls minimal checkout/resolve/Stripe capability stages and never promotion update, taxes, confirm, or start | `tests/test_gcash_probe.py` | Security integration | PASS |
+| 7 | The probe uses checkout → promotion update → tax sync → resolve → Stripe capability and never confirm, start, or payment execution | `tests/test_gcash_probe.py`, `tests/test_gcash_source_workflow.py` | Security integration | PASS |
 | 8 | Upstream session IDs cannot inject a different path | `tests/test_gcash_probe.py` | Security unit | PASS |
 | 9 | API input is deduplicated and bounded, missing tokens are safe, and one failure does not abort the batch | `tests/test_eligibility_api.py` | API integration | PASS |
 | 10 | Safe results persist without a schema migration and normalize legacy GCash records to the binary verdict | `tests/test_eligibility_db.py`, `tests/test_gcash_binary_policy.py` | Database integration | PASS |
@@ -106,8 +121,8 @@ for diagnosis.
 | 14 | Concurrent Plus and GCash persistence cannot overwrite the other result | `tests/test_eligibility_db.py` | Concurrency integration | PASS |
 | 15 | Resolve/Stripe capability failures do not erase conclusive method evidence | `tests/test_gcash_probe.py` | Transport contract | PASS |
 | 16 | Element Plus, project-owned UI text, and shipped static assets are English-only | `webui/frontend/tests/english-ui.test.mjs` | Frontend/build regression | PASS |
-| 17 | Checkout country follows the proxy/IP instead of forcing PH, preventing non-PH exits from producing a billing-country HTTP 400 | `tests/test_gcash_probe.py` | Live-regression transport contract | PASS |
-| 18 | The UI exposes the inferred checkout country/currency and explains that PH/PHP checks need a Philippines exit | `webui/frontend/tests/eligibility.test.mjs` | Frontend unit | PASS |
+| 17 | GCash Checkout uses the explicit PH/PHP contract and reports a mismatched proxy as a billing-country failure | `tests/test_gcash_probe.py`, `tests/test_gcash_source_workflow.py` | Live-regression transport contract | PASS |
+| 18 | The UI explains the PH/PHP checkout, promotion update, tax sync, and Philippines proxy requirement | `webui/frontend/tests/eligibility.test.mjs` | Frontend unit | PASS |
 
 ## GREEN evidence
 
@@ -115,7 +130,7 @@ Backend suite:
 
 ```text
 python -m unittest discover -s tests -p "test_*.py" -v
-Ran 59 tests
+Ran 62 tests
 OK
 ```
 
@@ -123,7 +138,7 @@ Frontend suite:
 
 ```text
 npm --prefix webui/frontend test
-tests 10, pass 10, fail 0
+tests 11, pass 11, fail 0
 ```
 
 Production frontend:

@@ -21,9 +21,15 @@ CHATGPT_PAYMENTS_BASE = "https://chatgpt.com/backend-api/payments"
 STRIPE_PAYMENT_PAGE_INIT_URL = "https://api.stripe.com/v1/payment_pages/{session_id}/init"
 # Kept as a compatibility constant for callers that imported the old probe.
 STRIPE_ELEMENTS_URL = "https://api.stripe.com/v1/elements/sessions"
-# Kept for compatibility with older integrations. The availability probe no
-# longer sends this campaign to ChatGPT.
+# Kept as a public compatibility constant and used by the source-compatible
+# checkout and promotion-update stages.
 PROMOTION_ID = "plus-1-month-free"
+GCASH_CHECKOUT_COUNTRY = "PH"
+GCASH_CHECKOUT_CURRENCY = "PHP"
+CHECKOUT_UPDATE_PATH = "/backend-api/payments/checkout/update"
+CHECKOUT_UPDATE_URL = f"https://chatgpt.com{CHECKOUT_UPDATE_PATH}"
+CHECKOUT_TAXES_PATH = "/backend-api/payments/checkout/taxes"
+CHECKOUT_TAXES_URL = f"https://chatgpt.com{CHECKOUT_TAXES_PATH}"
 _USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/145.0.0.0 Safari/537.36"
@@ -423,6 +429,9 @@ def _evidence(payloads: Iterable[Any]) -> dict[str, Any]:
     elif custom_non_gcash_present:
         method_available = False
     elif custom_candidate_present:
+        # The checkout exposes a live opaque custom-method slot. In this
+        # provider-specific probe that slot is the GCash capability candidate;
+        # Elements metadata is still queried when credentials are available.
         method_available = True
     else:
         method_available = False if explicit_method_collection else None
@@ -641,19 +650,90 @@ def _checkout_session(payload: Mapping[str, Any]) -> tuple[str, str]:
     return session_id, processor
 
 
-def _checkout_payload() -> dict[str, Any]:
-    """Build a checkout whose country follows the selected proxy egress.
+def _checkout_payload(*, promo_campaign_id: str = PROMOTION_ID) -> dict[str, Any]:
+    """Build the Philippines Checkout contract used by the source workflow.
 
-    ChatGPT rejects a hard-coded PH billing country when the proxy exits in a
-    different region. Leaving billing details out lets the checkout service
-    derive the request country from the egress IP; a PH proxy will therefore
-    expose the PH/PHP method set, while another region is evaluated as-is.
+    GCash is a Philippines/PHP payment method. The selected proxy must exit in
+    the same region; otherwise ChatGPT can reject the request as a billing
+    country mismatch. The region is intentionally explicit here so the probe
+    does not silently report a different country's method set.
     """
     return {
         "entry_point": "all_plans_pricing_modal",
         "plan_name": "chatgptplusplan",
+        "billing_details": {
+            "country": GCASH_CHECKOUT_COUNTRY,
+            "currency": GCASH_CHECKOUT_CURRENCY,
+        },
         "checkout_ui_mode": "custom",
+        "promo_campaign": {
+            "promo_campaign_id": str(promo_campaign_id or PROMOTION_ID).strip(),
+            "is_coupon_from_query_param": False,
+        },
+        # The upstream GCash adapter asks Checkout to perform its card/proxy
+        # capability check. This is still a checkout capability request; it is
+        # not a payment-method creation or confirmation operation.
+        "check_card_proxy": True,
     }
+
+
+def _promotion_update_payload(
+    checkout_session_id: str,
+    processor: str,
+    *,
+    promo_campaign_id: str = PROMOTION_ID,
+) -> dict[str, Any]:
+    """Build the source-compatible promotion update for one checkout.
+
+    The update is deliberately tied to the session returned by Checkout. It
+    cannot create a second session or select a different account.
+    """
+    return {
+        "checkout_session_id": checkout_session_id,
+        "processor_entity": processor,
+        "plan_name": "chatgptplusplan",
+        "price_interval": "month",
+        "seat_quantity": 1,
+        "promo_campaign": {
+            "promo_campaign_id": str(promo_campaign_id or PROMOTION_ID).strip(),
+            "is_coupon_from_query_param": False,
+        },
+    }
+
+
+def _tax_update_payload(
+    checkout_session_id: str,
+    processor: str,
+    payloads: Iterable[Any],
+    *,
+    checkout_email: str = "",
+) -> dict[str, Any]:
+    """Build a minimal best-effort tax-sync request.
+
+    The source workflow performs this stage after promotion update. We only
+    reuse region data observed in the checkout response and an explicitly
+    supplied account email; no fabricated address, card, or payment identity
+    is inserted. A tax endpoint rejection is non-fatal to capability reading.
+    """
+    country = _first_mapping_value(
+        payloads,
+        {"country", "billing_country", "checkout_country"},
+    ).strip().upper() or GCASH_CHECKOUT_COUNTRY
+    currency = _first_mapping_value(
+        payloads,
+        {"currency", "currency_code"},
+    ).strip().upper() or GCASH_CHECKOUT_CURRENCY
+    payload: dict[str, Any] = {
+        "checkout_session_id": checkout_session_id,
+        "checkout_email": str(checkout_email or "").strip(),
+        "billing_country": country,
+        "currency": currency,
+        "tax_id": None,
+        "processor_entity": processor,
+    }
+    if country:
+        payload["billing_address"] = {"country": country}
+    return payload
 
 
 def _first_mapping_value(payloads: Iterable[Any], names: set[str]) -> str:
@@ -748,9 +828,15 @@ def _stripe_elements_params(
         return None
     billing = checkout.get("billing_details")
     raw_currency = billing.get("currency") if isinstance(billing, Mapping) else checkout.get("currency")
-    currency = str(raw_currency or "php").strip().lower() or "php"
+    currency = (
+        str(raw_currency or GCASH_CHECKOUT_CURRENCY).strip().lower()
+        or GCASH_CHECKOUT_CURRENCY.lower()
+    )
     raw_country = billing.get("country") if isinstance(billing, Mapping) else checkout.get("country")
-    country = str(raw_country or "PH").strip().upper() or "PH"
+    country = (
+        str(raw_country or GCASH_CHECKOUT_COUNTRY).strip().upper()
+        or GCASH_CHECKOUT_COUNTRY
+    )
     locale, timezone = _BROWSER_PROFILES.get(country, ("en-US", "America/New_York"))
     params: dict[str, str] = {
         "customer_session_client_secret": customer_secret,
@@ -770,6 +856,19 @@ def _stripe_elements_params(
         "deferred_intent[setup_future_usage]": "off_session",
         "_stripe_version": _STRIPE_VERSION,
     }
+    payment_methods = checkout.get("payment_method_types")
+    if isinstance(payment_methods, (list, tuple)):
+        for index, method in enumerate(payment_methods):
+            if isinstance(method, Mapping):
+                method = (
+                    method.get("type")
+                    or method.get("payment_method_type")
+                    or method.get("name")
+                    or method.get("id")
+                )
+            token = _key(method)
+            if token:
+                params[f"deferred_intent[payment_method_types][{index}]"] = token
     for index, custom_id in enumerate(ids):
         params[f"custom_payment_methods[{index}]"] = custom_id
     return publishable_key, params
@@ -786,6 +885,7 @@ def probe_gcash(
     proxy: str = "",
     timeout: int = 30,
     require_zero: bool = True,
+    checkout_email: str = "",
     session_factory: Callable[..., Any] | None = None,
     checked_at: float | None = None,
 ) -> dict[str, Any]:
@@ -833,6 +933,65 @@ def probe_gcash(
         checkout_session_id, processor = _checkout_session(checkout)
         payloads: list[Mapping[str, Any]] = [checkout]
 
+        # Match the reference GCash adapter's promotion-update and tax-sync
+        # stages. Both are best-effort capability preparation steps; neither
+        # creates a payment method, confirms Checkout, or starts a provider
+        # redirect. Their responses are retained as additional evidence.
+        checkout_referer = f"https://chatgpt.com/checkout/{processor}/{checkout_session_id}"
+        update_route = CHECKOUT_UPDATE_PATH
+        stage = "promotion_update"
+        try:
+            update_headers = _chatgpt_headers(
+                token,
+                account_id=account_id,
+                device_id=stable_device_id,
+                cookie_header=cookie_header,
+                route=update_route,
+            )
+            update_headers["Referer"] = checkout_referer
+            updated = _post_json(
+                session,
+                CHECKOUT_UPDATE_URL,
+                _promotion_update_payload(
+                    checkout_session_id,
+                    processor,
+                ),
+                update_headers,
+                timeout,
+                stage,
+            )
+            payloads.append(updated)
+        except _ProbeFailure as exc:
+            optional_failures.append(exc)
+
+        taxes_route = CHECKOUT_TAXES_PATH
+        stage = "taxes"
+        try:
+            taxes_headers = _chatgpt_headers(
+                token,
+                account_id=account_id,
+                device_id=stable_device_id,
+                cookie_header=cookie_header,
+                route=taxes_route,
+            )
+            taxes_headers["Referer"] = checkout_referer
+            taxes = _post_json(
+                session,
+                CHECKOUT_TAXES_URL,
+                _tax_update_payload(
+                    checkout_session_id,
+                    processor,
+                    payloads,
+                    checkout_email=checkout_email,
+                ),
+                taxes_headers,
+                timeout,
+                stage,
+            )
+            payloads.append(taxes)
+        except _ProbeFailure as exc:
+            optional_failures.append(exc)
+
         # Resolve is useful when the initial response only contains a session
         # and credentials. It is best effort because checkout evidence alone
         # can answer the availability question.
@@ -858,13 +1017,16 @@ def probe_gcash(
             pass
 
         discovered = _evidence(payloads)["custom_method_ids"]
+        configured_id = _custom_method_id(os.getenv("GCASH_CUSTOM_PAYMENT_METHOD_ID", ""))
+        custom_ids_for_probe = list(dict.fromkeys(
+            [*discovered, configured_id] if configured_id else discovered
+        ))
         stripe_context = _stripe_context(payloads)
-        evidence_before_stripe = _evidence(payloads)
         # Payment Pages init is the read-only capability source for standard
         # method lists. Custom methods use the Elements endpoint below because
         # it accepts the live opaque custom-method IDs.
-        stripe_request = _stripe_init_params(stripe_context, discovered)
-        if not discovered and stripe_request is not None and checkout_session_id.startswith("cs_"):
+        stripe_request = _stripe_init_params(stripe_context, custom_ids_for_probe)
+        if not custom_ids_for_probe and stripe_request is not None and checkout_session_id.startswith("cs_"):
             publishable_key, stripe_params = stripe_request
             stage = "stripe_capability"
             try:
@@ -882,8 +1044,8 @@ def probe_gcash(
 
         # If a custom ID is available but Payment Pages did not name GCash,
         # ask the Elements endpoint for the custom-method display metadata.
-        if discovered and not evidence_before_stripe["explicit_method_present"]:
-            elements_request = _stripe_elements_params(stripe_context, discovered)
+        if custom_ids_for_probe:
+            elements_request = _stripe_elements_params(stripe_context, custom_ids_for_probe)
             if elements_request is not None:
                 publishable_key, elements_params = elements_request
                 stage = "stripe_custom_capability"

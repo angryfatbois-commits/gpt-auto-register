@@ -68,6 +68,7 @@ class GCashSourceWorkflowTests(unittest.TestCase):
 
         result = probe_gcash(
             "access-token",
+            checkout_email="person@example.com",
             session_factory=lambda **_: session,
         )
 
@@ -85,7 +86,10 @@ class GCashSourceWorkflowTests(unittest.TestCase):
 
         checkout_payload = session.calls[0][2]["json"]
         self.assertTrue(checkout_payload["check_card_proxy"])
-        self.assertNotIn("billing_details", checkout_payload)
+        self.assertEqual(
+            checkout_payload["billing_details"],
+            {"country": "PH", "currency": "PHP"},
+        )
 
         update_payload = session.calls[1][2]["json"]
         self.assertEqual(update_payload["checkout_session_id"], "cs_source_workflow")
@@ -106,6 +110,7 @@ class GCashSourceWorkflowTests(unittest.TestCase):
         self.assertEqual(taxes_payload["processor_entity"], "openai_ie")
         self.assertEqual(taxes_payload["billing_country"], "PH")
         self.assertEqual(taxes_payload["currency"], "PHP")
+        self.assertEqual(taxes_payload["checkout_email"], "person@example.com")
 
     def test_configured_custom_method_id_is_probed_when_checkout_is_opaque(self):
         checkout = {
@@ -140,6 +145,32 @@ class GCashSourceWorkflowTests(unittest.TestCase):
             session.calls[-1][2]["params"]["custom_payment_methods[0]"],
             "cpmt_configured_source_workflow",
         )
+
+    def test_optional_update_failures_do_not_erase_resolved_method_evidence(self):
+        session = _Session([
+            _Response(_checkout()),
+            _Response({"message": "temporary"}, status_code=503),
+            _Response({"message": "temporary"}, status_code=503),
+            _Response(_resolved()),
+            _Response({"custom_payment_method_data": [{
+                "id": "cpmt_dynamic_source_workflow",
+                "display_name": "GCash",
+            }]}),
+        ])
+
+        result = probe_gcash(
+            "access-token",
+            checkout_email="person@example.com",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["decision"], "gcash_available")
+        self.assertFalse(result["retryable"])
+        self.assertFalse(any(
+            "confirm" in url or "custom_payment_method/start" in url
+            for _, url, _ in session.calls
+        ))
 
 
 if __name__ == "__main__":

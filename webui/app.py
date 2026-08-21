@@ -1159,6 +1159,7 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
                 device_id=device_id,
                 cookie_header=str(credential.get("cookie_header") or ""),
                 proxy=proxy,
+                checkout_email=email,
             ))
         except Exception:
             logger.warning("[gcash_check] unexpected probe failure for %s", email)

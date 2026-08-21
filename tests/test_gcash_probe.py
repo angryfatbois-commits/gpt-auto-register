@@ -21,6 +21,13 @@ class FakeSession:
 
     def post(self, url, **kwargs):
         self.calls.append(("POST", url, kwargs))
+        # The source-compatible probe performs best-effort update/tax stages.
+        # Keep legacy fixtures focused on their original checkout/resolve
+        # responses while still recording those additional calls.
+        if url.endswith("/payments/checkout/update"):
+            return FakeResponse({"discountAmounts": {"total": 0}})
+        if url.endswith("/payments/checkout/taxes"):
+            return FakeResponse({"ok": True})
         return self.responses.pop(0)
 
     def get(self, url, **kwargs):
@@ -257,10 +264,13 @@ class GCashNetworkProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 3)
+        self.assertEqual(len(session.calls), 5)
         checkout_call = session.calls[0]
-        self.assertNotIn("promo_campaign", checkout_call[2]["json"])
-        self.assertNotIn("check_card_proxy", checkout_call[2]["json"])
+        self.assertEqual(
+            checkout_call[2]["json"]["promo_campaign"]["promo_campaign_id"],
+            "plus-1-month-free",
+        )
+        self.assertTrue(checkout_call[2]["json"]["check_card_proxy"])
         stripe_call = session.calls[-1]
         self.assertEqual(
             stripe_call[1], "https://api.stripe.com/v1/elements/sessions",
@@ -270,7 +280,7 @@ class GCashNetworkProbeTests(unittest.TestCase):
             "cpmt_dynamic_from_checkout",
         )
 
-    def test_probe_does_not_send_promotion_or_tax_requests(self):
+    def test_probe_sends_source_promotion_and_tax_requests(self):
         checkout = {
             "checkout_session_id": "cs_test_method_only",
             "processor_entity": "openai_ie",
@@ -287,15 +297,19 @@ class GCashNetworkProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 2)
-        self.assertNotIn("promo_campaign", session.calls[0][2]["json"])
-        self.assertNotIn("check_card_proxy", session.calls[0][2]["json"])
+        self.assertEqual(len(session.calls), 4)
+        self.assertEqual(session.calls[0][1], "https://chatgpt.com/backend-api/payments/checkout")
+        self.assertTrue(session.calls[0][2]["json"]["check_card_proxy"])
+        self.assertEqual(
+            session.calls[0][2]["json"]["promo_campaign"]["promo_campaign_id"],
+            "plus-1-month-free",
+        )
         urls = [url for _, url, _ in session.calls]
-        self.assertFalse(any(url.endswith("/payments/checkout/update") for url in urls))
-        self.assertFalse(any(url.endswith("/payments/checkout/taxes") for url in urls))
+        self.assertTrue(any(url.endswith("/payments/checkout/update") for url in urls))
+        self.assertTrue(any(url.endswith("/payments/checkout/taxes") for url in urls))
 
-    def test_checkout_does_not_force_ph_billing_country(self):
-        """The upstream must infer country from the selected proxy/IP."""
+    def test_checkout_uses_the_source_ph_payment_contract(self):
+        """GCash capability is evaluated against the Philippines checkout."""
         checkout = {
             "checkout_session_id": "cs_test_inferred_country",
             "processor_entity": "openai_ie",
@@ -316,8 +330,11 @@ class GCashNetworkProbeTests(unittest.TestCase):
 
         self.assertEqual(result["classification"], "ineligible")
         checkout_payload = session.calls[0][2]["json"]
-        self.assertNotIn("billing_details", checkout_payload)
-        self.assertNotIn("promo_campaign", checkout_payload)
+        self.assertEqual(
+            checkout_payload["billing_details"],
+            {"country": "PH", "currency": "PHP"},
+        )
+        self.assertIn("promo_campaign", checkout_payload)
         self.assertEqual(result["checkout_country"], "PH")
         self.assertEqual(result["currency"], "PHP")
         self.assertEqual(
@@ -404,7 +421,7 @@ class GCashNetworkProbeTests(unittest.TestCase):
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 2)
+        self.assertEqual(len(session.calls), 4)
 
     def test_probe_stops_before_any_payment_execution_endpoint(self):
         checkout = {
@@ -439,10 +456,9 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(factory_calls[0]["proxy"], "socks5://proxy-user:proxy-pass@example.test:1080")
         self.assertTrue(session.closed)
         urls = [url for _, url, _ in session.calls]
-        self.assertEqual(len(urls), 2)
+        self.assertEqual(len(urls), 5)
         self.assertTrue(any(url.endswith("/payments/checkout") for url in urls))
         self.assertTrue(any("/payments/checkout/openai_ie/cs_test_safe_probe" in url for url in urls))
-        self.assertFalse(any(url == "https://api.stripe.com/v1/elements/sessions" for url in urls))
         self.assertFalse(any("confirm" in url or "custom_payment_method/start" in url for url in urls))
         self.assertTrue(all(call[2]["allow_redirects"] is False for call in session.calls))
         serialized = repr(result)
