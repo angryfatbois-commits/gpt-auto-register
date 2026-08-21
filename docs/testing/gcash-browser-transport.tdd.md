@@ -17,8 +17,8 @@ automated browser contract.
 | --- | --- | --- |
 | RED | `python -m unittest tests.test_gcash_probe.GCashNetworkProbeTests.test_generic_checkout_http_400_retries_with_a_minimal_ph_contract tests.test_http_client.HttpClientIsolationTests.test_isolated_post_matches_tls_profile_and_keeps_proxy -v` | Failed as intended: the probe used `chrome110` then `firefox144`, and the HTTP wrapper had no isolated POST method. |
 | GREEN | Same command after implementation | 2 tests passed. |
-| Focused regression | `python -m unittest tests.test_gcash_probe tests.test_gcash_source_workflow tests.test_gcash_binary_policy tests.test_eligibility_api tests.test_eligibility_db tests.test_http_client -v` | 65 tests passed. |
-| Full backend | `python -m unittest discover -s tests -p "test_*.py" -v` | 91 tests passed. |
+| Focused regression | `python -m unittest tests.test_gcash_probe tests.test_gcash_source_workflow tests.test_gcash_binary_policy tests.test_eligibility_api tests.test_eligibility_db tests.test_http_client -v` | 66 tests passed. |
+| Full backend | `python -m unittest discover -s tests -p "test_*.py" -v` | 92 tests passed. |
 | Frontend | `npm test` in `webui/frontend` | 28 tests passed. |
 | Production build | `npm run build` in `webui/frontend` | Passed. |
 | Dependency checks | `python -m pip check` and `npm audit --omit=dev --audit-level=high` | No broken requirements; 0 vulnerabilities. |
@@ -34,11 +34,12 @@ automated browser contract.
 | 5 | SOCKS DNS continues through the proxy and neither checkout attempt invokes confirmation, custom-method start, or payment execution | Both targets plus the GCash regression suite | Privacy/security regression | PASS |
 | 6 | Access tokens, cookies, proxy credentials, checkout IDs, and the browser session ID are not returned in the eligibility result | GCash network-probe security tests | Data-exposure regression | PASS |
 | 7 | Recognized HTTP 400/422 messages become stable allowlisted codes while unknown messages stay generic and no body text is returned | `test_checkout_400_reason_is_reduced_to_a_safe_stable_code` | Diagnostic/security regression | PASS |
+| 8 | A recognized promotion rejection still receives the safe minimal checkout retry | `test_checkout_promotion_rejection_still_uses_minimal_retry` | Compatibility regression | PASS |
 
 ## Coverage and known gaps
 
 The optional Python `coverage` module is not installed, so a numeric backend
-coverage percentage was not produced. All 91 discovered backend tests and all
+coverage percentage was not produced. All 92 discovered backend tests and all
 28 frontend tests passed. Pyright, Ruff, and a frontend lint script are not
 available in this repository; Python compilation, backend tests, the frontend
 production build, dependency checks, and diff validation passed instead.
@@ -54,3 +55,5 @@ once from the WebUI to validate the upstream behavior.
 - GREEN checkpoint: `9edb108` (`fix: align gcash checkout browser transport`)
 - Diagnostic RED checkpoint: `57ce5fe` (`test: classify safe gcash checkout rejection reasons`)
 - Diagnostic GREEN checkpoint: `c56f9f3` (`fix: classify safe gcash checkout rejection reasons`)
+- Promotion-retry RED checkpoint: `35723ad` (`test: preserve minimal retry for rejected promotion`)
+- Promotion-retry GREEN checkpoint: `8012268` (`fix: retry checkout without rejected promotion`)
