@@ -17,8 +17,8 @@ automated browser contract.
 | --- | --- | --- |
 | RED | `python -m unittest tests.test_gcash_probe.GCashNetworkProbeTests.test_generic_checkout_http_400_retries_with_a_minimal_ph_contract tests.test_http_client.HttpClientIsolationTests.test_isolated_post_matches_tls_profile_and_keeps_proxy -v` | Failed as intended: the probe used `chrome110` then `firefox144`, and the HTTP wrapper had no isolated POST method. |
 | GREEN | Same command after implementation | 2 tests passed. |
-| Focused regression | `python -m unittest tests.test_gcash_probe tests.test_gcash_source_workflow tests.test_gcash_binary_policy tests.test_eligibility_api tests.test_eligibility_db tests.test_http_client -v` | 64 tests passed. |
-| Full backend | `python -m unittest discover -s tests -p "test_*.py" -v` | 90 tests passed. |
+| Focused regression | `python -m unittest tests.test_gcash_probe tests.test_gcash_source_workflow tests.test_gcash_binary_policy tests.test_eligibility_api tests.test_eligibility_db tests.test_http_client -v` | 65 tests passed. |
+| Full backend | `python -m unittest discover -s tests -p "test_*.py" -v` | 91 tests passed. |
 | Frontend | `npm test` in `webui/frontend` | 28 tests passed. |
 | Production build | `npm run build` in `webui/frontend` | Passed. |
 | Dependency checks | `python -m pip check` and `npm audit --omit=dev --audit-level=high` | No broken requirements; 0 vulnerabilities. |
@@ -38,7 +38,7 @@ automated browser contract.
 ## Coverage and known gaps
 
 The optional Python `coverage` module is not installed, so a numeric backend
-coverage percentage was not produced. All 90 discovered backend tests and all
+coverage percentage was not produced. All 91 discovered backend tests and all
 28 frontend tests passed. Pyright, Ruff, and a frontend lint script are not
 available in this repository; Python compilation, backend tests, the frontend
 production build, dependency checks, and diff validation passed instead.
@@ -53,3 +53,4 @@ once from the WebUI to validate the upstream behavior.
 - RED checkpoint: `277daa9` (`test: cover browser-compatible gcash checkout transport`)
 - GREEN checkpoint: `9edb108` (`fix: align gcash checkout browser transport`)
 - Diagnostic RED checkpoint: `57ce5fe` (`test: classify safe gcash checkout rejection reasons`)
+- Diagnostic GREEN checkpoint: `c56f9f3` (`fix: classify safe gcash checkout rejection reasons`)
