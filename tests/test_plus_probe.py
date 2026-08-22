@@ -1,9 +1,15 @@
 import base64
 import json
 import unittest
+import uuid
 
 
-from plus_probe import probe_plus_eligibility, should_persist_plus_result
+from plus_probe import (
+    plus_operator_note,
+    probe_plus_eligibility,
+    safe_plus_result_label,
+    should_persist_plus_result,
+)
 
 
 def _jwt(account_id="account-stable"):
@@ -67,6 +73,11 @@ class _Session:
 
     def close(self):
         self.closed = True
+
+
+class _BrokenJsonResponse(_Response):
+    def json(self):
+        raise ValueError("private invalid response")
 
 
 class PlusProbeTests(unittest.TestCase):
@@ -166,6 +177,118 @@ class PlusProbeTests(unittest.TestCase):
         self.assertFalse(should_persist_plus_result({"status": "error"}))
         self.assertFalse(should_persist_plus_result({"status": "no_at"}))
         self.assertFalse(should_persist_plus_result({"status": "not_found"}))
+
+    def test_missing_token_and_oversized_proxy_fail_before_network(self):
+        factories = []
+
+        missing = probe_plus_eligibility(
+            "",
+            email="person@example.com",
+            session_factory=lambda **kwargs: factories.append(kwargs),
+        )
+        oversized = probe_plus_eligibility(
+            "access-token",
+            email="person@example.com",
+            proxy="p" * 2049,
+            session_factory=lambda **kwargs: factories.append(kwargs),
+        )
+
+        self.assertEqual(missing["decision"], "missing_access_token")
+        self.assertEqual(oversized["decision"], "proxy_url_too_long")
+        self.assertEqual(factories, [])
+
+    def test_http_and_json_failures_have_stable_safe_codes(self):
+        cases = (
+            (_Response({}, status_code=401, text="expired"), "token_invalid", False),
+            (_Response({}, status_code=403, text="forbidden"), "http_403", False),
+            (_Response({}, status_code=503), "http_503", True),
+            (_BrokenJsonResponse({}, status_code=200), "invalid_json", True),
+        )
+
+        for response, decision, retryable in cases:
+            with self.subTest(decision=decision):
+                session = _Session(response)
+                result = probe_plus_eligibility(
+                    "access-token",
+                    email="person@example.com",
+                    session_factory=lambda **_: session,
+                )
+                self.assertEqual(result["decision"], decision)
+                self.assertIs(result["retryable"], retryable)
+                self.assertNotIn("private", repr(result))
+                self.assertTrue(session.closed)
+
+    def test_network_decisions_and_operator_notes_are_allowlisted(self):
+        cases = (
+            (
+                "http://proxy.example:8080",
+                RuntimeError("connect failed (7) with private detail"),
+                "proxy_unreachable",
+                "The proxy is unreachable (curl error 7)",
+            ),
+            (
+                "http://proxy.example:8080",
+                RuntimeError("generic private proxy failure"),
+                "proxy_network_error",
+                "The proxy request failed; direct fallback was not used",
+            ),
+            (
+                "",
+                RuntimeError("generic private direct failure"),
+                "network_error",
+                "",
+            ),
+        )
+
+        for proxy, error, decision, note in cases:
+            with self.subTest(decision=decision):
+                session = _Session(error=error)
+                result = probe_plus_eligibility(
+                    "access-token",
+                    email="person@example.com",
+                    proxy=proxy,
+                    session_factory=lambda **_: session,
+                )
+                self.assertEqual(result["decision"], decision)
+                self.assertEqual(plus_operator_note(result), note)
+                self.assertNotIn("private", repr(result))
+
+    def test_invalid_identity_headers_fall_back_to_a_stable_device(self):
+        session = _Session(_Response({
+            "accounts": {
+                "default": {
+                    "account": {"plan_type": "free", "is_deactivated": False},
+                    "entitlement": {
+                        "subscription_plan": "chatgptfreeplan",
+                        "has_active_subscription": False,
+                    },
+                    "eligible_promo_campaigns": {},
+                },
+            },
+        }))
+
+        result = probe_plus_eligibility(
+            "access-token",
+            email="person@example.com",
+            device_id="bad\r\nInjected: device",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["decision"], "campaign_not_available")
+        headers = session.calls[0][1]["headers"]
+        self.assertNotIn("ChatGPT-Account-ID", headers)
+        self.assertEqual(str(uuid.UUID(headers["OAI-Device-Id"])), headers["OAI-Device-Id"])
+        self.assertNotIn("Injected", repr(headers))
+
+    def test_operator_log_label_fails_closed(self):
+        self.assertEqual(
+            safe_plus_result_label({"status": "plus_eligible", "label": "attacker"}),
+            "Plus trial eligible",
+        )
+        self.assertEqual(
+            safe_plus_result_label({"status": "untrusted", "label": "private secret"}),
+            "Plus trial check failed",
+        )
 
 
 if __name__ == "__main__":

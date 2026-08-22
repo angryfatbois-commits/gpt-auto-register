@@ -222,6 +222,42 @@ class RealtimeRunEventTests(unittest.TestCase):
         self.assertEqual(controller._registered_fail, 0)
         self.assertNotIn("sensitive post-check failure", repr(controller._run_event_history))
 
+    def test_failed_registration_never_runs_plus_check(self):
+        controller = AutoLoopController(self._database_path)
+        controller._state = AutoLoopState.RUNNING
+        controller._options = {"cool_down_seconds": 0}
+        provider = type("Provider", (), {"pooled": True})
+        account = {
+            "email": "failed@example.com",
+            "password": "mail-password",
+            "client_id": "client",
+            "refresh_token": "refresh",
+            "kind": "outlook",
+        }
+
+        def finish_with_failure(_run_id):
+            controller._stop_event.set()
+            return False, "account"
+
+        with db.use_database_path(self._database_path), \
+                mock.patch("webui.auto_loop.get_provider_class", return_value=provider), \
+                mock.patch.object(db, "claim_next", return_value=account), \
+                mock.patch.object(registrar, "start_registration", return_value="run-failed"), \
+                mock.patch.object(
+                    controller,
+                    "_wait_run_finish",
+                    side_effect=finish_with_failure,
+                ), \
+                mock.patch.object(
+                    controller,
+                    "_check_plus_after_registration",
+                ) as check_plus:
+            controller._worker_loop_scoped(0)
+
+        check_plus.assert_not_called()
+        self.assertEqual(controller._registered_ok, 0)
+        self.assertEqual(controller._registered_fail, 1)
+
 
 if __name__ == "__main__":
     unittest.main()

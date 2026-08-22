@@ -90,6 +90,44 @@ class PlusEligibilityApiTests(unittest.TestCase):
                 emails=[f"person-{index}@example.com" for index in range(51)]
             )
 
+    def test_one_plus_probe_failure_does_not_abort_remaining_accounts(self):
+        credentials = {
+            "one@example.com": {"access_token": "one-token"},
+            "two@example.com": {"access_token": "two-token"},
+        }
+        eligible = {
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "plus_1_month_free_available",
+            "status": "plus_eligible",
+            "label": "Plus trial eligible",
+            "checked_at": 10.0,
+        }
+
+        def probe(access_token, **_):
+            if access_token == "one-token":
+                raise RuntimeError("private token-secret from upstream")
+            return eligible
+
+        with patch(
+            "webui.app.db.get_registered",
+            side_effect=lambda email: credentials[email],
+        ), patch("webui.app.probe_plus_eligibility", side_effect=probe), \
+                patch("webui.app.db.update_plus_check") as persist:
+            response = api_check_plus(CheckPlusReq(
+                emails=["one@example.com", "two@example.com"]
+            ))
+
+        first = response["results"]["one@example.com"]
+        self.assertEqual(first["decision"], "probe_unexpected_error")
+        self.assertNotIn("token-secret", repr(first))
+        self.assertEqual(
+            response["results"]["two@example.com"]["classification"],
+            "eligible",
+        )
+        persist.assert_called_once_with("two@example.com", eligible)
+
 
 class GCashEligibilityApiTests(unittest.TestCase):
     def test_fastapi_route_accepts_confirmed_loopback_request(self):
