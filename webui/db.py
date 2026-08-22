@@ -765,6 +765,7 @@ _SAFE_ELIGIBILITY_FIELDS = frozenset({
     "trusted_custom_method_matched", "custom_method_probe_status",
     "custom_method_probe_failure", "custom_method_probe_exception",
     "auth_refresh_status",
+    "zero_payment", "amount_status",
 })
 _SENSITIVE_EXTRA_KEYS = frozenset({
     "accesstoken",

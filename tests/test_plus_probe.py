@@ -6,6 +6,7 @@ import uuid
 
 from plus_probe import (
     plus_operator_note,
+    probe_plus_eligibility_in_session,
     probe_plus_eligibility,
     safe_plus_result_label,
     should_persist_plus_result,
@@ -81,6 +82,51 @@ class _BrokenJsonResponse(_Response):
 
 
 class PlusProbeTests(unittest.TestCase):
+    def test_session_aware_helper_reuses_identity_without_closing_the_session(self):
+        session = _Session(_Response(_eligible_payload()))
+
+        result = probe_plus_eligibility_in_session(
+            _jwt(),
+            session=session,
+            email="person@example.com",
+            account_id="account-stable",
+            device_id="device-stable",
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/146.0.0.0 Safari/537.36"
+            ),
+            checked_at=10.0,
+        )
+
+        self.assertEqual(result["status"], "plus_eligible")
+        self.assertEqual(result["discount_percentage"], 100)
+        self.assertEqual(result["duration_periods"], 1)
+        self.assertEqual(result["duration_unit"], "month")
+        self.assertFalse(session.closed)
+        _, request = session.calls[0]
+        self.assertIs(request["allow_redirects"], False)
+        self.assertEqual(request["headers"]["User-Agent"], (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/146.0.0.0 Safari/537.36"
+        ))
+
+    def test_session_aware_helper_sanitizes_cookie_and_user_agent_headers(self):
+        session = _Session(_Response(_eligible_payload()))
+
+        result = probe_plus_eligibility_in_session(
+            "access-token",
+            session=session,
+            cookie_header="safe=value; bad\r\nInjected: yes",
+            user_agent="custom-agent\r\nInjected: yes",
+        )
+
+        self.assertEqual(result["status"], "plus_eligible")
+        headers = session.calls[0][1]["headers"]
+        self.assertEqual(headers["Cookie"], "safe=value")
+        self.assertNotIn("Injected", repr(headers))
+
     def test_eligible_probe_reuses_selected_proxy_and_blocks_redirects(self):
         session = _Session(_Response(_eligible_payload()))
         factories = []
@@ -103,7 +149,7 @@ class PlusProbeTests(unittest.TestCase):
         self.assertEqual(result["checked_at"], 10.0)
         self.assertEqual(
             factories,
-            [{"proxy": "http://ph-proxy.example:8080", "impersonate": "chrome110"}],
+            [{"proxy": "http://ph-proxy.example:8080", "impersonate": "chrome146"}],
         )
         self.assertEqual(len(session.calls), 1)
         _, request = session.calls[0]

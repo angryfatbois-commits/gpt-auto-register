@@ -37,13 +37,19 @@ from eligibility import plus_probe_error  # noqa: E402
 from gcash_probe import (  # noqa: E402
     gcash_probe_error,
     normalize_gcash_result,
-    probe_gcash,
+    probe_checkout_eligibility,
 )
 from plus_probe import (  # noqa: E402
     plus_operator_note,
     probe_plus_eligibility,
     should_persist_plus_result,
 )
+
+# Keep the short module-level name used by existing integrations and tests,
+# while resolving the combined workflow at call time so dependency injection
+# can patch either public name safely.
+def probe_gcash(*args, **kwargs):
+    return probe_checkout_eligibility(*args, **kwargs)
 from mail_providers import (  # noqa: E402
     ImportValidationError,
     MailProviderError,
@@ -1283,7 +1289,7 @@ def api_check_plus(req: CheckPlusReq):
 
 @app.post("/api/registered/check_gcash")
 def api_check_gcash(req: CheckGCashReq, request: Request):
-    """Check whether GCash is exposed, without confirming or starting payment."""
+    """Run the read-only Plus + GCash workflow without executing payment."""
     _require_local_confirmed_gcash_request(request)
     emails = list(dict.fromkeys(
         str(email or "").strip().lower() for email in req.emails
@@ -1298,10 +1304,15 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         raise HTTPException(400, "Proxy URL is too long")
 
     results: dict[str, dict] = {}
+    plus_results: dict[str, dict] = {}
     summary = {"eligible": 0, "ineligible": 0}
     for email in emails:
         credential = db.get_registered(email)
         if not credential:
+            plus_results[email] = plus_probe_error(
+                "account_not_found", retryable=False,
+                status="not_found", label="Not found",
+            )
             result = gcash_probe_error(
                 "account_not_found", retryable=False,
                 status="not_found", label="Not found",
@@ -1311,11 +1322,17 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
             continue
         access_token = str(credential.get("access_token") or "").strip()
         if not access_token:
+            plus_info = plus_probe_error(
+                "missing_access_token", retryable=False,
+                status="no_at", label="No access token",
+            )
+            plus_results[email] = plus_info
             result = gcash_probe_error(
                 "missing_access_token", retryable=False,
                 status="no_at", label="No access token",
             )
             results[email] = result
+            db.update_eligibility_check(email, "plus_check", plus_info)
             db.update_eligibility_check(email, "gcash_check", result)
             summary["ineligible"] += 1
             continue
@@ -1326,26 +1343,47 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         ).strip()
         device_id = _gcash_device_id(credential, email)
         try:
-            result = normalize_gcash_result(probe_gcash(
+            workflow = probe_gcash(
                 access_token=access_token,
                 account_id=account_id,
                 device_id=device_id,
                 cookie_header=str(credential.get("cookie_header") or ""),
                 proxy=proxy,
                 checkout_email=email,
-            ))
+            )
+            if isinstance(workflow, dict) and isinstance(workflow.get("gcash"), dict):
+                plus_info = workflow.get("plus") or {}
+                raw_result = workflow.get("gcash") or {}
+            else:
+                # Compatibility for callers that still inject a GCash-only
+                # probe. Production always returns the combined envelope.
+                plus_info = {}
+                raw_result = workflow
+            plus_results[email] = dict(plus_info)
+            result = normalize_gcash_result(raw_result)
         except Exception:
             logger.warning("[gcash_check] unexpected probe failure for %s", email)
+            plus_results[email] = plus_probe_error(
+                "probe_unexpected_error", retryable=True, status="error",
+            )
             result = gcash_probe_error(
                 "probe_unexpected_error", retryable=True,
                 status="error",
             )
         results[email] = result
+        plus_info = plus_results.get(email)
+        if isinstance(plus_info, dict) and should_persist_plus_result(plus_info):
+            db.update_eligibility_check(email, "plus_check", plus_info)
         db.update_eligibility_check(email, "gcash_check", result)
         classification = str(result.get("classification") or "ineligible")
         summary["eligible" if classification == "eligible" else "ineligible"] += 1
 
-    return {"ok": True, "results": results, "summary": summary}
+    return {
+        "ok": True,
+        "results": results,
+        "plus_results": plus_results,
+        "summary": summary,
+    }
 
 
 # ──────────────────────── auto-loop ────────────────────────

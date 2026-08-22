@@ -1,5 +1,10 @@
 # GCash checkout compatibility retry TDD evidence
 
+> **Historical record:** The compatibility path described here (including
+> promo-dropping and alternate fingerprints) is no longer active. See
+> [`har-checkout-workflow.tdd.md`](har-checkout-workflow.tdd.md) for the current
+> same-payload retry contract.
+
 > Historical note: the alternate-fingerprint retry documented here was later
 > superseded by the stable browser-identity and isolated transport described in
 > `gcash-browser-transport.tdd.md`.

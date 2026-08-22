@@ -45,6 +45,8 @@ def get_sentinel_token(
     max_touch_points: int = 0,
     device_pixel_ratio: float = 0.0,
     timezone: str = "",
+    sentinel_sdk_url: str = "",
+    sentinel_req_url: str = "",
 ) -> tuple[str, str]:
     """Return ``(sentinel_token, so_token)`` or raise RuntimeError."""
     try:
@@ -55,6 +57,9 @@ def get_sentinel_token(
             flow=flow,
             log=lambda m: logger.info(m),
             user_agent=user_agent,
+            sec_ch_ua=sec_ch_ua,
+            sec_ch_ua_platform=sec_ch_ua_platform,
+            sec_ch_ua_mobile=sec_ch_ua_mobile,
             screen=screen,
             lang=lang,
             lang_full=lang_full,
@@ -71,6 +76,8 @@ def get_sentinel_token(
             sec_ch_ua_bitness=sec_ch_ua_bitness,
             sec_ch_ua_model=sec_ch_ua_model,
             sec_ch_ua_platform_version=sec_ch_ua_platform_version,
+            sentinel_sdk_url=sentinel_sdk_url,
+            sentinel_req_url=sentinel_req_url,
         )
         if qresult:
             return qresult

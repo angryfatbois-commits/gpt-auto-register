@@ -1,5 +1,9 @@
 # GCash browser transport TDD evidence
 
+> **Historical record:** This document covers a superseded transport variant.
+> The current HAR-backed three-request workflow and its evidence are in
+> [`har-checkout-workflow.tdd.md`](har-checkout-workflow.tdd.md).
+
 ## Source and user journey
 
 No plan file was supplied. The journey was derived from a production result

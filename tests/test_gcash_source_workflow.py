@@ -53,7 +53,7 @@ class _Session:
         self.closed = True
 
 
-def _jwt(account_id="account-stable", *, issued_at=None):
+def _jwt(account_id="account-stable", *, issued_at=None, issuer="https://auth.openai.com"):
     """Build a synthetic account-bound token for session-refresh tests."""
     issued_at = int(time.time() if issued_at is None else issued_at)
 
@@ -63,7 +63,7 @@ def _jwt(account_id="account-stable", *, issued_at=None):
 
     header = {"alg": "RS256", "kid": "synthetic-key", "typ": "JWT"}
     payload = {
-        "iss": "https://auth.openai.com",
+        "iss": issuer,
         "aud": ["https://api.openai.com/v1"],
         "sub": "synthetic-user",
         "client_id": "synthetic-client",
@@ -228,6 +228,7 @@ class GCashHarWorkflowTests(unittest.TestCase):
         stripe_headers = elements.calls[0][2]["headers"]
         self.assertEqual(checkout_headers["User-Agent"], stripe_headers["User-Agent"])
         self.assertNotIn("Cookie", stripe_headers)
+        self.assertNotIn("Authorization", stripe_headers)
         self.assertNotIn("ChatGPT-Account-Id", stripe_headers)
 
     def test_checkout_request_exactly_matches_the_observed_payload(self):
@@ -331,10 +332,7 @@ class GCashHarWorkflowTests(unittest.TestCase):
         self.assertIsNone(result["gcash"]["amount_minor"])
         self.assertIsNone(result["gcash"]["zero_payment"])
         self.assertEqual(result["gcash"]["amount_status"], "unavailable")
-        self.assertEqual(
-            elements.calls[0][2]["params"]["deferred_intent[amount]"],
-            "0",
-        )
+        self.assertEqual(elements.calls, [])
 
     def test_result_envelope_never_exposes_request_secrets_or_opaque_ids(self):
         result, _, _, _ = _run()
@@ -394,6 +392,63 @@ class GCashHarWorkflowTests(unittest.TestCase):
         self.assertNotIn("unrelated", checkout_call[2]["headers"]["Cookie"])
         self.assertEqual(chatgpt.cookies, {})
 
+    def test_cross_account_refresh_is_rejected_and_stored_credentials_are_used(self):
+        old_token = _jwt()
+        foreign_token = _jwt("different-account", issued_at=int(time.time()) + 1)
+        chatgpt = _Session([
+            _Response({"accessToken": foreign_token}),
+            _Response(_accounts_check()),
+            _Response(_checkout()),
+        ])
+        chatgpt.cookies = {"__Secure-next-auth.session-token": "foreign-cookie"}
+        elements = _Session([_Response(_stripe())])
+        sessions = [chatgpt, elements]
+
+        result = probe_checkout_eligibility(
+            old_token,
+            account_id="account-stable",
+            device_id="11111111-2222-4333-8444-555555555555",
+            cookie_header=(
+                "oai-did=11111111-2222-4333-8444-555555555555; "
+                "__Secure-next-auth.session-token=stored-cookie"
+            ),
+            session_factory=lambda **_: sessions.pop(0),
+            checked_at=10.0,
+        )
+
+        self.assertEqual(result["gcash"]["classification"], "eligible")
+        self.assertEqual(result["gcash"]["auth_refresh_status"], "token_account_mismatch")
+        checkout_headers = chatgpt.calls[2][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
+        self.assertIn("stored-cookie", checkout_headers["Cookie"])
+        self.assertNotIn("foreign-cookie", checkout_headers["Cookie"])
+
+    def test_untrusted_refresh_issuer_is_rejected_without_leaking_the_token(self):
+        old_token = _jwt()
+        foreign_token = _jwt(issuer="https://attacker.invalid", issued_at=int(time.time()) + 1)
+        chatgpt = _Session([
+            _Response({"accessToken": foreign_token}),
+            _Response(_accounts_check()),
+            _Response(_checkout()),
+        ])
+        chatgpt.cookies = {"__Secure-next-auth.session-token": "attacker-cookie"}
+        elements = _Session([_Response(_stripe())])
+        sessions = [chatgpt, elements]
+
+        result = probe_checkout_eligibility(
+            old_token,
+            account_id="account-stable",
+            device_id="11111111-2222-4333-8444-555555555555",
+            cookie_header="__Secure-next-auth.session-token=stored-cookie",
+            session_factory=lambda **_: sessions.pop(0),
+            checked_at=10.0,
+        )
+
+        self.assertEqual(result["gcash"]["classification"], "eligible")
+        self.assertEqual(result["gcash"]["auth_refresh_status"], "token_claim_mismatch")
+        self.assertNotIn(foreign_token, repr(result))
+        self.assertNotIn("attacker-cookie", repr(result))
+
     def test_chatgpt_requests_include_browser_client_hints_from_the_verified_profile(self):
         result, chatgpt, _, _ = _run()
         self.assertEqual(result["gcash"]["classification"], "eligible")
@@ -403,6 +458,8 @@ class GCashHarWorkflowTests(unittest.TestCase):
             self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
             self.assertEqual(headers["sec-fetch-site"], "same-origin")
             self.assertIn("Chromium", headers["sec-ch-ua"])
+            self.assertIn('146.0.0.0', headers["sec-ch-ua-full-version-list"])
+            self.assertIn("Not?A_Brand", headers["sec-ch-ua"])
 
 
 if __name__ == "__main__":

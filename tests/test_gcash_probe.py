@@ -1,1464 +1,375 @@
-import base64
-import json
-import os
+"""Focused unit tests for the strict HAR-backed capability probe."""
+
+from __future__ import annotations
+
 import unittest
-from unittest.mock import patch
+
+from gcash_probe import (
+    CHECKOUT_URL,
+    STRIPE_ELEMENTS_URL,
+    classify_gcash_evidence,
+    normalize_gcash_result,
+    probe_checkout_eligibility,
+    probe_gcash,
+)
 
 
-from gcash_probe import classify_gcash_evidence, probe_gcash
+METHOD_ID = "cpmt_synthetic_gcash"
 
 
-class FakeResponse:
-    def __init__(self, payload, status_code=200, headers=None):
-        self._payload = payload
+class _Response:
+    def __init__(self, payload, status_code=200):
+        self.payload = payload
         self.status_code = status_code
-        self.headers = headers or {}
+        self.headers = {"content-type": "application/json"}
 
     def json(self):
-        return self._payload
+        return self.payload
 
 
-class FakeSession:
-    def __init__(self, responses, auth_response=None, auth_error=None, cookies=None):
-        self.responses = responses
-        self.auth_response = auth_response
-        self.auth_error = auth_error
-        self.cookies = cookies or {}
+class _Session:
+    def __init__(self, responses):
+        self.responses = list(responses)
         self.calls = []
         self.closed = False
-        self.isolated_posts = 0
-
-    def post(self, url, **kwargs):
-        self.calls.append(("POST", url, kwargs))
-        # The source-compatible probe performs best-effort update/tax stages.
-        # Keep legacy fixtures focused on their original checkout/resolve
-        # responses while still recording those additional calls.
-        if url.endswith("/payments/checkout/update"):
-            return FakeResponse({"discountAmounts": {"total": 0}})
-        if url.endswith("/payments/checkout/taxes"):
-            return FakeResponse({"ok": True})
-        return self.responses.pop(0)
-
-    def post_isolated(self, url, **kwargs):
-        self.isolated_posts += 1
-        return self.post(url, **kwargs)
+        self.cookies = {}
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
-        if url == "https://chatgpt.com/api/auth/session":
-            if self.auth_error:
-                raise self.auth_error
-            return self.auth_response if self.auth_response is not None else FakeResponse({})
         return self.responses.pop(0)
+
+    def post(self, url, **kwargs):
+        self.calls.append(("POST", url, kwargs))
+        return self.responses.pop(0)
+
+    def post_isolated(self, url, **kwargs):
+        return self.post(url, **kwargs)
 
     def close(self):
         self.closed = True
 
 
-def _gcash_payload(amount=0, currency="php"):
+def accounts_payload(campaign=True):
     return {
-        "total_summary": {"due": amount},
-        "currency": currency,
+        "accounts": {
+            "default": {
+                "account": {"plan_type": "free", "is_deactivated": False},
+                "entitlement": {
+                    "subscription_plan": "chatgptfreeplan",
+                    "has_active_subscription": False,
+                },
+                "eligible_promo_campaigns": (
+                    {
+                        "plus": {
+                            "id": "plus-1-month-free",
+                            "metadata": {
+                                "discount": {"percentage": 100},
+                                "duration": {"num_periods": 1, "period": "month"},
+                            },
+                        }
+                    }
+                    if campaign
+                    else {}
+                ),
+            }
+        }
+    }
+
+
+def checkout_payload(amount=0, method_id=METHOD_ID):
+    return {
+        "checkout_session_id": "cs_synthetic",
+        "publishable_key": "pk_synthetic",
+        "processor_entity": "openai_llc",
+        "customer_session_client_secret": "cuss_synthetic",
+        "billing_details": {"country": "PH", "currency": "PHP"},
+        "payment_method_types": ["card", "link"],
+        "custom_payment_methods": [{"id": method_id}],
+        "checkout_state": {
+            "currency": "php",
+            "total": {"total": {"minorUnitsAmount": amount}},
+        },
+        "one_click_trial_eligible": False,
+    }
+
+
+def stripe_payload(method_id=METHOD_ID, label="GCash"):
+    return {
+        "payment_method_preference": {"country_code": "VN"},
         "custom_payment_method_data": [
-            {"id": "cpmt_live_discovered", "display_name": "GCash"}
+            {"type": method_id, "display_name": label}
         ],
     }
 
 
-def _jwt(payload):
-    def encode(part):
-        raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
-        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+def run_probe(*, checkout=None, stripe=None, accounts=None, proxy="http://proxy.test:8080",
+              chatgpt_responses=None):
+    chatgpt = _Session(
+        list(chatgpt_responses)
+        if chatgpt_responses is not None
+        else [
+            _Response(accounts if accounts is not None else accounts_payload()),
+            _Response(checkout if checkout is not None else checkout_payload()),
+        ]
+    )
+    stripe_session = _Session([
+        _Response(stripe if stripe is not None else stripe_payload())
+    ])
+    sessions = [chatgpt, stripe_session]
+    factories = []
 
-    return f"{encode({'alg': 'RS256', 'kid': 'test-key', 'typ': 'JWT'})}.{encode(payload)}.signature"
+    def factory(**kwargs):
+        factories.append(kwargs)
+        return sessions.pop(0)
 
-
-def _account_token(
-    account_id,
-    *,
-    issuer="https://auth.openai.com",
-    subject="user-stable",
-    issued_at=1,
-):
-    return _jwt({
-        "iss": issuer,
-        "aud": ["https://api.openai.com/v1"],
-        "sub": subject,
-        "client_id": "test-client",
-        "iat": issued_at,
-        "exp": 4_102_444_800,
-        "https://api.openai.com/auth": {
-            "chatgpt_account_id": account_id,
-        },
-    })
+    result = probe_gcash(
+        "access-token",
+        proxy=proxy,
+        device_id="device-stable",
+        session_factory=factory,
+        checked_at=10,
+    )
+    return result, chatgpt, stripe_session, factories
 
 
 class GCashClassificationTests(unittest.TestCase):
-    def test_explicit_gcash_zero_due_php_is_eligible(self):
-        result = classify_gcash_evidence([_gcash_payload()], checked_at=10.0)
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-        self.assertEqual(result["amount_minor"], 0)
-        self.assertEqual(result["currency"], "PHP")
-        self.assertTrue(result["method_available"])
-        self.assertEqual(result["status"], "eligible")
-        self.assertEqual(result["label"], "GCash available")
-
-    def test_explicit_gcash_positive_due_php_is_eligible(self):
-        result = classify_gcash_evidence([_gcash_payload(amount=115000)])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-        self.assertEqual(result["amount_minor"], 115000)
-
-    def test_wrong_currency_does_not_hide_an_explicit_gcash_method(self):
-        result = classify_gcash_evidence([_gcash_payload(currency="usd")])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-
-    def test_explicit_custom_method_list_without_gcash_is_ineligible(self):
-        payload = {
-            "total_summary": {"due": 0},
-            "currency": "php",
-            "custom_payment_method_data": [{"id": "cpmt_other", "display_name": "Other"}],
-        }
-
-        result = classify_gcash_evidence([payload])
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["decision"], "gcash_unavailable")
-
-    def test_nested_explicit_gcash_method_is_available(self):
-        result = classify_gcash_evidence([
-            {
-                "elements_options": {
-                    "ordered_payment_method_types": [
-                        {"payment_method_type": "GCash"},
-                    ],
-                },
-            }
-        ])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["method_available"])
-
-    def test_missing_amount_is_irrelevant_to_method_detection(self):
-        payload = {
-            "currency": "php",
-            "custom_payment_method_data": [
-                {"id": "cpmt_discovered", "display_name": "GCash"}
-            ],
-        }
-
-        result = classify_gcash_evidence([payload])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-        self.assertTrue(result["conclusive"])
-        self.assertFalse(result["retryable"])
-
-    def test_conflicting_amounts_do_not_hide_an_explicit_gcash_method(self):
-        result = classify_gcash_evidence([_gcash_payload(0), _gcash_payload(100)])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-
-    def test_conflicting_currencies_do_not_hide_an_explicit_gcash_method(self):
-        result = classify_gcash_evidence([
-            _gcash_payload(0, "php"),
-            _gcash_payload(0, "usd"),
-        ])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-
-    def test_negative_amount_is_irrelevant_to_method_detection(self):
-        result = classify_gcash_evidence([_gcash_payload(amount=-1)])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-
-    def test_missing_method_evidence_is_ineligible(self):
-        result = classify_gcash_evidence([{"currency": "php", "amount_due": 0}])
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_evidence_missing")
-
-    def test_missing_currency_is_ineligible(self):
-        payload = {
-            "amount_due": 0,
-            "custom_payment_method_data": [
-                {"id": "cpmt_discovered", "display_name": "GCash"}
-            ],
-        }
-
-        result = classify_gcash_evidence([payload])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_available")
-
-    def test_live_custom_method_id_without_display_label_is_a_gcash_candidate(self):
-        result = classify_gcash_evidence([
-            {
-                "custom_payment_methods": ["cpmt_live_discovered"],
-            }
-        ])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertTrue(result["method_available"])
-        self.assertTrue(result["custom_method_id_discovered"])
-
-    def test_scalar_custom_method_id_is_a_gcash_candidate(self):
-        """Checkout may return the opaque custom method in a scalar field."""
-        result = classify_gcash_evidence([
-            {"custom_payment_method_type_id": "cpmt_scalar_discovered"}
-        ])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertTrue(result["method_available"])
-        self.assertTrue(result["custom_method_id_discovered"])
-
-    def test_scalar_custom_method_object_with_non_gcash_label_is_ineligible(self):
-        result = classify_gcash_evidence([
-            {
-                "custom_payment_method": {
-                    "id": "cpmt_scalar_discovered",
-                    "display_name": "Other wallet",
-                }
-            }
-        ])
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertFalse(result["method_available"])
-
-    def test_unrelated_non_gcash_custom_method_does_not_override_gcash_candidate(self):
-        result = classify_gcash_evidence([
-            {"custom_payment_methods": ["cpmt_candidate_one"]},
-            {
-                "custom_payment_method_data": [
-                    {"id": "cpmt_other_wallet", "display_name": "Other wallet"}
-                ]
-            },
-        ])
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertTrue(result["method_available"])
-
-    def test_generic_custom_payment_placeholder_without_id_is_ineligible(self):
-        result = classify_gcash_evidence([
-            {"payment_method_types": ["card", "custom_payment_method"]}
-        ])
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertEqual(result["decision"], "gcash_unavailable")
-
-    def test_explicit_non_gcash_custom_label_overrides_an_opaque_candidate(self):
-        result = classify_gcash_evidence([
-            {"custom_payment_methods": ["cpmt_live_discovered"]},
-            {
-                "custom_payment_method_data": [
-                    {"id": "cpmt_live_discovered", "display_name": "Other wallet"}
-                ]
-            },
-        ])
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["method_available"])
-
-    def test_accepted_configured_gcash_id_overrides_a_nonliteral_display_label(self):
+    def test_har_shaped_payload_is_available_with_zero_due(self):
         result = classify_gcash_evidence(
-            [{
-                "custom_payment_method_data": [{
-                    "type": "cpmt_configured_one",
-                    "display_name": "Localized wallet label",
-                }],
-            }],
-            trusted_custom_method_ids=["cpmt_configured_one"],
+            [checkout_payload(), stripe_payload()],
+            checked_at=10,
         )
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["eligible"])
-        self.assertTrue(result["method_available"])
+        self.assertEqual(result["amount_minor"], 0)
+        self.assertIs(result["zero_payment"], True)
 
-    def test_nonliteral_label_without_configured_id_remains_ineligible(self):
-        result = classify_gcash_evidence([{
-            "custom_payment_method_data": [{
-                "type": "cpmt_untrusted_wallet",
-                "display_name": "Localized wallet label",
-            }],
-        }])
+    def test_positive_due_does_not_change_method_eligibility(self):
+        result = classify_gcash_evidence(
+            [checkout_payload(amount=98214), stripe_payload()]
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["amount_minor"], 98214)
+        self.assertIs(result["zero_payment"], False)
+
+    def test_id_mismatch_label_mismatch_and_missing_metadata_fail_closed(self):
+        cases = (
+            [checkout_payload(), stripe_payload("cpmt_other")],
+            [checkout_payload(), stripe_payload(label="Other wallet")],
+            [checkout_payload(), {}],
+        )
+        decisions = (
+            "gcash_method_id_mismatch",
+            "gcash_label_missing",
+            "gcash_metadata_missing",
+        )
+        for payloads, decision in zip(cases, decisions):
+            with self.subTest(decision=decision):
+                result = classify_gcash_evidence(payloads)
+                self.assertEqual(result["classification"], "ineligible")
+                self.assertEqual(result["decision"], decision)
+
+    def test_malformed_total_never_becomes_zero(self):
+        checkout = checkout_payload()
+        checkout["checkout_state"]["total"]["total"]["minorUnitsAmount"] = "not-a-number"
+
+        result = classify_gcash_evidence([checkout, stripe_payload()])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["decision"], "gcash_amount_missing")
+        self.assertIsNone(result["amount_minor"])
+        self.assertIsNone(result["zero_payment"])
+
+    def test_negative_total_is_incomplete_evidence(self):
+        checkout = checkout_payload(amount=-1)
+
+        result = classify_gcash_evidence([checkout, stripe_payload()])
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["decision"], "gcash_amount_missing")
+        self.assertIsNone(result["amount_minor"])
+
+    def test_legacy_unknown_is_normalized_to_binary_unavailable(self):
+        result = normalize_gcash_result({
+            "classification": "unknown",
+            "eligible": None,
+            "status": "unknown",
+            "decision": "checkout_timeout",
+        })
 
         self.assertEqual(result["classification"], "ineligible")
         self.assertFalse(result["eligible"])
+        self.assertEqual(result["status"], "error")
+        self.assertEqual(result["label"], "GCash unavailable")
+
+    def test_opaque_method_flag_without_a_verified_label_fails_closed(self):
+        result = normalize_gcash_result({
+            "method_available": True,
+            "custom_method_id_discovered": True,
+        })
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+
+    def test_untrusted_diagnostics_are_removed_from_the_result(self):
+        result = normalize_gcash_result({
+            "classification": "ineligible",
+            "custom_method_probe_status": "failed",
+            "custom_method_probe_failure": "Bearer secret-token",
+            "custom_method_probe_exception": "ConnectionError",
+            "auth_refresh_status": "cookie-secret",
+            "currency": "PHP<script>",
+            "checkout_country": "PH\r\nInjected",
+        })
+
+        self.assertEqual(result["custom_method_probe_status"], "failed")
+        self.assertEqual(result["custom_method_probe_failure"], "")
+        self.assertEqual(result["custom_method_probe_exception"], "connectionerror")
+        self.assertEqual(result["auth_refresh_status"], "")
+        self.assertEqual(result["currency"], "")
+        self.assertEqual(result["checkout_country"], "")
+        self.assertNotIn("secret-token", repr(result))
+
+    def test_malformed_timestamp_does_not_break_normalization(self):
+        result = normalize_gcash_result({"checked_at": "not-a-timestamp"})
+
+        self.assertIsInstance(result["checked_at"], float)
+
+    def test_negative_amount_cannot_survive_normalization_as_eligible(self):
+        result = normalize_gcash_result({
+            "classification": "eligible",
+            "eligible": True,
+            "amount_minor": -1,
+        })
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertFalse(result["eligible"])
+        self.assertIsNone(result["amount_minor"])
+        self.assertEqual(result["amount_status"], "unavailable")
 
 
 class GCashNetworkProbeTests(unittest.TestCase):
-    def test_missing_access_token_returns_unavailable_without_network(self):
+    def test_missing_or_invalid_token_never_creates_a_session(self):
         factories = []
-
-        result = probe_gcash(
-            "",
-            session_factory=lambda **kwargs: factories.append(kwargs),
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertEqual(result["label"], "GCash unavailable")
-        self.assertEqual(result["decision"], "missing_access_token")
-        self.assertEqual(result["status"], "no_at")
-        self.assertEqual(factories, [])
-
-    def test_invalid_access_token_header_value_is_rejected_without_network(self):
-        factories = []
-
-        result = probe_gcash(
+        missing = probe_gcash("", session_factory=lambda **kwargs: factories.append(kwargs))
+        invalid = probe_gcash(
             "token\r\nInjected: value",
             session_factory=lambda **kwargs: factories.append(kwargs),
         )
 
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["decision"], "invalid_access_token")
-        self.assertEqual(result["status"], "token_invalid")
+        self.assertEqual(missing["status"], "no_at")
+        self.assertEqual(invalid["status"], "token_invalid")
         self.assertEqual(factories, [])
 
-    def test_rejects_checkout_session_path_injection(self):
-        session = FakeSession([
-            FakeResponse({
-                "checkout_session_id": "cs_valid/../../confirm",
-                "processor_entity": "openai_ie",
-            })
-        ])
+    def test_exact_three_requests_use_one_route_and_same_browser_identity(self):
+        result, chatgpt, stripe, factories = run_probe()
 
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(
+            [(method, url) for method, url, _ in chatgpt.calls],
+            [
+                ("GET", chatgpt.calls[0][1]),
+                ("POST", CHECKOUT_URL),
+            ],
+        )
+        self.assertEqual(
+            [(method, url) for method, url, _ in stripe.calls],
+            [("GET", STRIPE_ELEMENTS_URL)],
+        )
+        self.assertEqual(factories[0], factories[1])
+        self.assertEqual(factories[0]["proxy"], "http://proxy.test:8080")
+        self.assertEqual(
+            chatgpt.calls[1][2]["headers"]["User-Agent"],
+            stripe.calls[0][2]["headers"]["User-Agent"],
         )
 
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["label"], "GCash unavailable")
-        self.assertEqual(result["decision"], "checkout_session_invalid")
-        self.assertEqual(len(session.calls), 1)
+    def test_checkout_payload_is_exact_and_promo_is_retained_on_transient_retry(self):
+        checkout = checkout_payload()
+        first = _Response({"temporary": True}, status_code=503)
+        result, chatgpt, _, _ = run_probe(
+            chatgpt_responses=[_Response(accounts_payload()), first, _Response(checkout)]
+        )
 
-    def test_auth_session_refresh_uses_fresh_token_and_cookies_for_checkout_only(self):
-        old_token = _account_token("account-stable")
-        fresh_token = _account_token("account-stable", issued_at=2)
-        checkout = {
-            "checkout_session_id": "cs_test_refreshed_auth",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({"accessToken": fresh_token}),
-            cookies={
-                "__Secure-next-auth.session-token": "fresh-session-cookie-secret",
-                "oai-did": "device-stable",
-                "__cf_bm": "bad\r\nInjected: value",
-                "unrelated_cookie": "must-not-be-forwarded",
+        self.assertEqual(result["classification"], "eligible")
+        payloads = [call[2]["json"] for call in chatgpt.calls if call[0] == "POST"]
+        self.assertEqual(len(payloads), 2)
+        self.assertEqual(payloads[0], payloads[1])
+        self.assertEqual(payloads[0], {
+            "entry_point": "all_plans_pricing_modal",
+            "plan_name": "chatgptplusplan",
+            "billing_details": {"country": "PH", "currency": "PHP"},
+            "checkout_ui_mode": "custom",
+            "promo_campaign": {
+                "promo_campaign_id": "plus-1-month-free",
+                "is_coupon_from_query_param": False,
             },
-        )
+        })
+        self.assertNotIn("check_card_proxy", payloads[0])
 
-        result = probe_gcash(
-            old_token,
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header=(
-                "oai-did=device-stable; "
-                "__Secure-next-auth.session-token=old-session-cookie-secret; "
-                "__Host-next-auth.csrf-token=stored-csrf-secret; "
-                "oai-client-auth-info=stored-auth-info"
-            ),
-            proxy="http://ph-proxy.example:8080",
-            session_factory=lambda **_: session,
-        )
+    def test_vn_stripe_preference_and_non_ph_proxy_do_not_invalidate_gcash(self):
+        result, _, stripe, factories = run_probe(proxy="http://proxy.vn:8080")
 
         self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "refreshed")
-        auth_call = session.calls[0]
-        self.assertEqual(auth_call[0], "GET")
-        self.assertEqual(auth_call[1], "https://chatgpt.com/api/auth/session")
-        auth_headers = auth_call[2]["headers"]
-        for header in (
-            "Authorization",
-            "ChatGPT-Account-Id",
-            "Content-Type",
-            "x-openai-target-path",
-            "x-openai-target-route",
-        ):
-            self.assertNotIn(header, auth_headers)
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], f"Bearer {fresh_token}")
-        self.assertIn("__Secure-next-auth.session-token=fresh-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
-        self.assertIn("__Host-next-auth.csrf-token=stored-csrf-secret", checkout_headers["Cookie"])
-        self.assertIn("oai-client-auth-info=stored-auth-info", checkout_headers["Cookie"])
-        self.assertNotIn("unrelated_cookie", checkout_headers["Cookie"])
-        self.assertNotIn("Injected", checkout_headers["Cookie"])
-        self.assertNotIn(fresh_token, repr(result))
-        self.assertNotIn("fresh-session-cookie-secret", repr(result))
-        self.assertNotIn(old_token, repr(result))
-        self.assertNotIn("old-session-cookie-secret", repr(result))
-        self.assertEqual(session.cookies, {})
-
-    def test_refreshed_token_with_untrusted_issuer_is_not_adopted(self):
-        old_token = _account_token("account-stable")
-        untrusted_token = _account_token(
-            "account-stable",
-            issuer="https://attacker.invalid",
-        )
-        checkout = {
-            "checkout_session_id": "cs_test_untrusted_issuer",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({"accessToken": untrusted_token}),
-            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
-        )
-
-        result = probe_gcash(
-            old_token,
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "token_claim_mismatch")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
-        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertEqual(session.cookies, {})
-
-    def test_mismatched_auth_session_token_is_not_adopted(self):
-        old_token = _account_token("account-stable")
-        mismatched_token = _account_token("different-account")
-        checkout = {
-            "checkout_session_id": "cs_test_mismatched_refresh",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({"accessToken": mismatched_token}),
-            cookies={
-                "__Secure-next-auth.session-token": "fresh-session-cookie-secret",
-                "oai-did": "other-device",
-            },
-        )
-
-        result = probe_gcash(
-            old_token,
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
-            proxy="http://ph-proxy.example:8080",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "token_account_mismatch")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
-        self.assertIn("__Secure-next-auth.session-token=old-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
-        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertNotIn("oai-did=other-device", checkout_headers["Cookie"])
-        self.assertNotIn(mismatched_token, repr(result))
-        self.assertEqual(session.cookies, {})
-
-    def test_refresh_is_not_adopted_when_stored_token_is_bound_to_another_account(self):
-        old_token = _account_token("different-account")
-        fresh_token = _account_token("account-stable", issued_at=2)
-        checkout = {
-            "checkout_session_id": "cs_test_stored_token_mismatch",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({"accessToken": fresh_token}),
-            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
-        )
-
-        result = probe_gcash(
-            old_token,
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "token_unbound")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
-        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertEqual(session.cookies, {})
-
-    def test_invalid_refreshed_token_header_value_is_not_adopted(self):
-        invalid_token = _account_token("account-stable") + "\r\nInjected: value"
-        checkout = {
-            "checkout_session_id": "cs_test_invalid_refresh_token",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({"accessToken": invalid_token}),
-            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
-        )
-
-        result = probe_gcash(
-            "existing-access-token-secret",
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "token_invalid")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
-        self.assertNotIn("Injected", repr(checkout_headers))
-        self.assertEqual(session.cookies, {})
-
-    def test_auth_session_refresh_failure_falls_back_to_existing_credentials(self):
-        checkout = {
-            "checkout_session_id": "cs_test_refresh_failure",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_error=RuntimeError("simulated refresh failure with token-secret"),
-        )
-
-        result = probe_gcash(
-            "existing-access-token-secret",
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=existing-session-cookie-secret",
-            proxy="http://ph-proxy.example:8080",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "failed")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
-        self.assertIn("__Secure-next-auth.session-token=existing-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertNotIn("token-secret", repr(result))
-
-    def test_invalid_cookie_pair_is_removed_before_checkout(self):
-        checkout = {
-            "checkout_session_id": "cs_test_cookie_sanitization",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession([FakeResponse(checkout), FakeResponse(_gcash_payload())])
-
-        result = probe_gcash(
-            "existing-access-token-secret",
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header=(
-                "oai-did=device-stable; harmless=value; "
-                "bad=invalid\r\nInjected: header"
-            ),
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        checkout_headers = session.calls[0][2]["headers"]
-        self.assertIn("harmless=value", checkout_headers["Cookie"])
-        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
-        self.assertNotIn("Injected", checkout_headers["Cookie"])
-
-    def test_invalid_identity_values_are_not_forwarded_as_headers(self):
-        checkout = {
-            "checkout_session_id": "cs_test_identity_sanitization",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession([FakeResponse(checkout), FakeResponse(_gcash_payload())])
-
-        result = probe_gcash(
-            "existing-access-token-secret",
-            account_id="account-stable\r\nInjected: account",
-            device_id="device-stable\r\nInjected: device",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        checkout_headers = session.calls[0][2]["headers"]
-        self.assertNotIn("ChatGPT-Account-Id", checkout_headers)
-        self.assertNotIn("Injected", checkout_headers["OAI-Device-Id"])
-
-    def test_auth_session_without_bound_token_does_not_adopt_refreshed_cookies(self):
-        checkout = {
-            "checkout_session_id": "cs_test_unbound_refresh",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession(
-            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
-            auth_response=FakeResponse({}),
-            cookies={
-                "__Secure-next-auth.session-token": "unbound-session-cookie-secret",
-                "oai-did": "other-device",
-            },
-        )
-
-        result = probe_gcash(
-            "existing-access-token-secret",
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=existing-session-cookie-secret",
-            proxy="http://ph-proxy.example:8080",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(result["auth_refresh_status"], "no_token")
-        checkout_headers = session.calls[1][2]["headers"]
-        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
-        self.assertIn("__Secure-next-auth.session-token=existing-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertNotIn("unbound-session-cookie-secret", checkout_headers["Cookie"])
-        self.assertNotIn("oai-did=other-device", checkout_headers["Cookie"])
-        self.assertEqual(session.cookies, {})
-
-    def test_checkout_http_400_diagnostics_are_opt_in_and_sanitized(self):
-        rich = FakeSession([
-            FakeResponse(
-                {
-                    "detail": "secret body value",
-                    "error": {"message": "token-secret"},
-                    "sensitive_token_field": "do-not-log-key-or-value",
-                },
-                status_code=400,
-                headers={"Content-Type": "application/json; charset=utf-8"},
-            ),
-        ])
-        minimal = FakeSession([
-            FakeResponse(
-                {"detail": "another secret", "error": {"message": "cookie-secret"}},
-                status_code=400,
-                headers={"Content-Type": "application/json"},
-            ),
-        ])
-        sessions = [rich, minimal]
-        factories = []
-
-        def factory(**kwargs):
-            factories.append(kwargs)
-            return sessions.pop(0)
-
-        with patch.dict(os.environ, {"GCASH_SAFE_DIAGNOSTICS": "1"}):
-            with self.assertLogs("gcash_probe", level="INFO") as captured:
-                result = probe_gcash(
-                    "access-token-secret",
-                    account_id="account-stable",
-                    device_id="device-stable",
-                    cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=session-cookie-secret",
-                    proxy="http://ph-proxy.example:8080",
-                    session_factory=factory,
-                )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["decision"], "checkout_http_400")
-        self.assertEqual(
-            [item["proxy"] for item in factories],
-            ["http://ph-proxy.example:8080", "http://ph-proxy.example:8080"],
-        )
-        self.assertEqual(
-            [item["impersonate"] for item in factories],
-            ["chrome146", "chrome146"],
-        )
-        log_text = "\n".join(captured.output)
-        self.assertIn("attempt=rich", log_text)
-        self.assertIn("attempt=minimal", log_text)
-        self.assertIn("media=json", log_text)
-        self.assertIn("keys=detail,error", log_text)
-        self.assertIn("other_keys=1", log_text)
-        self.assertIn("length_bucket=lt_1kb", log_text)
-        for secret in (
-            "secret body value",
-            "token-secret",
-            "cookie-secret",
-            "sensitive_token_field",
-            "do-not-log-key-or-value",
-            "access-token-secret",
-            "session-cookie-secret",
-            "ph-proxy.example",
-        ):
-            self.assertNotIn(secret, log_text)
-
-    def test_checkout_http_400_diagnostics_are_disabled_by_default(self):
-        rich = FakeSession([FakeResponse({"detail": "secret body value"}, status_code=400)])
-        minimal = FakeSession([FakeResponse({"detail": "another secret"}, status_code=400)])
-        sessions = [rich, minimal]
-
-        def factory(**kwargs):
-            return sessions.pop(0)
-
-        with patch.dict(os.environ, {}, clear=True):
-            with self.assertLogs("gcash_probe", level="INFO") as captured:
-                result = probe_gcash(
-                    "access-token-secret",
-                    account_id="account-stable",
-                    device_id="device-stable",
-                    cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=session-cookie-secret",
-                    proxy="http://ph-proxy.example:8080",
-                    session_factory=factory,
-                )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["decision"], "checkout_http_400")
-        log_text = "\n".join(captured.output)
-        self.assertIn("checkout compatibility retry reason=checkout_http_400", log_text)
-        for marker in ("attempt=", "media=", "keys=", "length_bucket="):
-            self.assertNotIn(marker, log_text)
-
-    def test_generic_checkout_http_400_retries_with_a_minimal_ph_contract(self):
-        """A rejected optional promo payload must not hide a browser-visible method."""
-        method_id = "cpmt_checkout_compatibility_retry"
-        rejected_checkout = FakeSession([
-            FakeResponse({"detail": "request rejected"}, status_code=400),
-        ])
-        recovered_checkout = FakeSession([
-            FakeResponse({
-                "checkout_session_id": "cs_test_checkout_compatibility_retry",
-                "processor_entity": "openai_ie",
-                "publishable_key": "pk_test_checkout_compatibility_retry",
-                "customer_session_client_secret": "cuss_checkout_compatibility_retry",
-                "billing_details": {"country": "PH", "currency": "PHP"},
-                "custom_payment_methods": [method_id],
-            }),
-            FakeResponse({
-                "billing_details": {"country": "PH", "currency": "PHP"},
-                "custom_payment_methods": [method_id],
-            }),
-        ])
-        stripe = FakeSession([
-            FakeResponse({
-                "merchant_country": "PH",
-                "merchant_currency": "php",
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-        sessions = [rejected_checkout, recovered_checkout, stripe]
-        factories = []
-
-        def factory(**kwargs):
-            factories.append(kwargs)
-            return sessions.pop(0)
-
-        result = probe_gcash(
-            "access-token",
-            account_id="account-stable",
-            device_id="device-stable",
-            cookie_header="oai-did=device-stable; session=stored",
-            proxy="http://ph-proxy.example:8080",
-            session_factory=factory,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["method_available"])
-        self.assertEqual(
-            [item["impersonate"] for item in factories[:2]],
-            ["chrome146", "chrome146"],
-        )
-        self.assertEqual(
-            [item["proxy"] for item in factories[:2]],
-            ["http://ph-proxy.example:8080", "http://ph-proxy.example:8080"],
-        )
-        self.assertTrue(rejected_checkout.closed)
-        self.assertEqual(rejected_checkout.isolated_posts, 1)
-        self.assertGreaterEqual(recovered_checkout.isolated_posts, 1)
-        initial_headers = rejected_checkout.calls[0][2]["headers"]
-        retry_payload = recovered_checkout.calls[0][2]["json"]
-        retry_headers = recovered_checkout.calls[0][2]["headers"]
-        for headers in (initial_headers, retry_headers):
-            self.assertIn("Chrome/146.0.0.0", headers["User-Agent"])
-            self.assertIn('"146"', headers["sec-ch-ua"])
-            self.assertIn('"146"', headers["sec-ch-ua-full-version-list"])
-            self.assertEqual(headers["sec-ch-ua-mobile"], "?0")
-            self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
-            self.assertEqual(headers["sec-ch-ua-arch"], "x86")
-            self.assertEqual(headers["sec-ch-ua-bitness"], "64")
-            self.assertEqual(headers["sec-ch-ua-model"], "")
-            self.assertEqual(headers["sec-ch-ua-platform-version"], "10.0.0")
-            self.assertEqual(headers["Accept-Language"], "en-US,en;q=0.9")
-            self.assertEqual(headers["Accept-Encoding"], "gzip, deflate, br, zstd")
-            self.assertEqual(headers["oai-language"], "en-US")
-            self.assertEqual(headers["sec-fetch-dest"], "empty")
-            self.assertEqual(headers["sec-fetch-mode"], "cors")
-            self.assertEqual(headers["sec-fetch-site"], "same-origin")
-            self.assertEqual(headers["OAI-Device-Id"], "device-stable")
-            self.assertEqual(headers["ChatGPT-Account-Id"], "account-stable")
-            self.assertEqual(
-                headers["Cookie"],
-                "oai-did=device-stable; session=stored",
-            )
-            self.assertTrue(headers["oai-client-version"])
-            self.assertTrue(headers["oai-client-build-number"])
-        self.assertEqual(
-            initial_headers["oai-session-id"],
-            retry_headers["oai-session-id"],
-        )
-        self.assertEqual(
-            initial_headers["oai-client-version"],
-            retry_headers["oai-client-version"],
-        )
-        self.assertEqual(
-            initial_headers["oai-client-build-number"],
-            retry_headers["oai-client-build-number"],
-        )
-        chatgpt_session_id = initial_headers["oai-session-id"]
-        for _, url, kwargs in recovered_checkout.calls:
-            if url.startswith("https://chatgpt.com/"):
-                headers = kwargs["headers"]
-                self.assertEqual(headers["oai-session-id"], chatgpt_session_id)
-                self.assertEqual(headers["OAI-Device-Id"], "device-stable")
-                self.assertIn("Chrome/146.0.0.0", headers["User-Agent"])
-        self.assertNotIn(chatgpt_session_id, repr(result))
-        self.assertEqual(
-            retry_payload["billing_details"],
-            {"country": "PH", "currency": "PHP"},
-        )
-        self.assertNotIn("promo_campaign", retry_payload)
-        self.assertNotIn("check_card_proxy", retry_payload)
-        all_urls = [
-            url
-            for session in (rejected_checkout, recovered_checkout, stripe)
-            for _, url, _ in session.calls
-        ]
-        self.assertFalse(any(
-            "confirm" in url or "custom_payment_method/start" in url
-            for url in all_urls
-        ))
-
-    def test_opaque_custom_method_id_is_discovered_then_verified_by_stripe(self):
-        checkout = {
-            "checkout_session_id": "cs_test_dynamic_method",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_dynamic",
-            "customer_session_client_secret": "cuss_dynamic",
-            "custom_payment_methods": ["cpmt_dynamic_from_checkout"],
-            "total_summary": {"due": 0},
-            "currency": "php",
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({
-                "custom_payment_methods": ["cpmt_dynamic_from_checkout"],
-                "total_summary": {"due": 0},
-                "currency": "php",
-            }),
-            FakeResponse({
-                "custom_payment_method_data": [
-                    {"id": "cpmt_dynamic_from_checkout", "display_name": "GCash"}
-                ],
-                "total_summary": {"due": 0},
-                "currency": "php",
-            }),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 5)
-        checkout_call = session.calls[0]
-        self.assertEqual(
-            checkout_call[2]["json"]["promo_campaign"]["promo_campaign_id"],
-            "plus-1-month-free",
-        )
-        self.assertTrue(checkout_call[2]["json"]["check_card_proxy"])
-        stripe_call = session.calls[-1]
-        self.assertEqual(
-            stripe_call[1], "https://api.stripe.com/v1/elements/sessions",
-        )
-        self.assertEqual(
-            stripe_call[2]["params"]["custom_payment_methods[0]"],
-            "cpmt_dynamic_from_checkout",
-        )
-
-    def test_checkout_method_roundtrip_accepts_a_nonliteral_elements_label(self):
-        """Stripe acceptance is stronger evidence than a merchant-defined label."""
-        method_id = "cpmt_dynamic_roundtrip"
-        checkout = {
-            "checkout_session_id": "cs_test_dynamic_roundtrip",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_dynamic_roundtrip",
-            "customer_session_client_secret": "cuss_dynamic_roundtrip",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [method_id],
-            "total_summary": {"due": 125000},
-            "currency": "PHP",
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({
-                "billing_details": {"country": "PH", "currency": "PHP"},
-                "custom_payment_methods": [method_id],
-            }),
-            FakeResponse({
-                "merchant_country": "PH",
-                "merchant_currency": "php",
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertTrue(result["method_available"])
-        self.assertTrue(result["trusted_custom_method_matched"])
-        self.assertNotIn(method_id, repr(result))
-        self.assertFalse(any(
-            "confirm" in url or "custom_payment_method/start" in url
-            for _, url, _ in session.calls
-        ))
-
-    def test_non_ph_roundtrip_does_not_mark_gcash_available(self):
-        method_id = "cpmt_non_ph_roundtrip"
-        checkout = {
-            "checkout_session_id": "cs_test_non_ph_roundtrip",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_non_ph_roundtrip",
-            "customer_session_client_secret": "cuss_non_ph_roundtrip",
-            "billing_details": {"country": "US", "currency": "USD"},
-            "custom_payment_methods": [method_id],
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({
-                "billing_details": {"country": "US", "currency": "USD"},
-                "custom_payment_methods": [method_id],
-            }),
-            FakeResponse({
-                "merchant_country": "US",
-                "merchant_currency": "usd",
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["method_available"])
-        self.assertFalse(result["trusted_custom_method_matched"])
-
-    def test_elements_must_echo_the_checkout_id_for_a_nonliteral_label(self):
-        checkout_method_id = "cpmt_checkout_candidate"
-        elements_method_id = "cpmt_different_elements_method"
-        checkout = {
-            "checkout_session_id": "cs_test_mismatched_roundtrip",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_mismatched_roundtrip",
-            "customer_session_client_secret": "cuss_mismatched_roundtrip",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [checkout_method_id],
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({
-                "billing_details": {"country": "PH", "currency": "PHP"},
-                "custom_payment_methods": [checkout_method_id],
-            }),
-            FakeResponse({
-                "merchant_country": "PH",
-                "merchant_currency": "php",
-                "custom_payment_method_data": [{
-                    "type": elements_method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["method_available"])
-        self.assertFalse(result["trusted_custom_method_matched"])
-        self.assertNotIn(checkout_method_id, repr(result))
-        self.assertNotIn(elements_method_id, repr(result))
-
-    def test_elements_failure_exposes_only_a_stable_stage_code(self):
-        method_id = "cpmt_elements_failure"
-        checkout = {
-            "checkout_session_id": "cs_test_elements_failure",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_elements_failure",
-            "customer_session_client_secret": "cuss_elements_failure",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [method_id],
-        }
-
-        class ElementsFailureSession(FakeSession):
-            def get(self, url, **kwargs):
-                if url.endswith("/v1/elements/sessions"):
-                    raise RuntimeError("simulated transport failure")
-                return super().get(url, **kwargs)
-
-        session = ElementsFailureSession([
-            FakeResponse(checkout),
-            FakeResponse({"custom_payment_methods": [method_id]}),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["custom_method_probe_status"], "failed")
-        self.assertEqual(
-            result["custom_method_probe_failure"],
-            "stripe_custom_capability_transport_error",
-        )
-        self.assertEqual(result["custom_method_probe_exception"], "RuntimeError")
-        self.assertNotIn("simulated transport failure", repr(result))
-
-    def test_elements_capability_uses_a_separate_stripe_session(self):
-        method_id = "cpmt_separate_stripe_session"
-        checkout = {
-            "checkout_session_id": "cs_test_separate_stripe_session",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_separate_stripe_session",
-            "customer_session_client_secret": "cuss_separate_stripe_session",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [method_id],
-        }
-        chatgpt_session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"custom_payment_methods": [method_id]}),
-        ])
-        stripe_session = FakeSession([
-            FakeResponse({
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-        factories = []
-
-        def factory(**kwargs):
-            factories.append(kwargs)
-            return chatgpt_session if len(factories) == 1 else stripe_session
-
-        result = probe_gcash("access-token", session_factory=factory)
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(
-            [item["impersonate"] for item in factories],
-            ["chrome146", "firefox144"],
-        )
-        self.assertTrue(stripe_session.closed)
-        self.assertTrue(chatgpt_session.closed)
-
-    def test_elements_request_user_agent_matches_the_firefox_fingerprint(self):
-        method_id = "cpmt_firefox_user_agent"
-        checkout = {
-            "checkout_session_id": "cs_test_firefox_user_agent",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_firefox_user_agent",
-            "customer_session_client_secret": "cuss_firefox_user_agent",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [method_id],
-        }
-        chatgpt_session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"custom_payment_methods": [method_id]}),
-        ])
-        stripe_session = FakeSession([
-            FakeResponse({
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-        sessions = [chatgpt_session, stripe_session]
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: sessions.pop(0),
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        stripe_headers = stripe_session.calls[0][2]["headers"]
-        self.assertIn("Firefox/144.0", stripe_headers["User-Agent"])
-        self.assertNotIn("Chrome/145.0.0.0", stripe_headers["User-Agent"])
-
-    def test_elements_transport_retries_with_an_alternate_fingerprint(self):
-        method_id = "cpmt_elements_retry"
-        checkout = {
-            "checkout_session_id": "cs_test_elements_retry",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_elements_retry",
-            "customer_session_client_secret": "cuss_elements_retry",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-            "custom_payment_methods": [method_id],
-        }
-
-        class FlakyElementsSession(FakeSession):
-            def get(self, url, **kwargs):
-                if url.endswith("/v1/elements/sessions"):
-                    raise ConnectionError("simulated transient transport failure")
-                return super().get(url, **kwargs)
-
-        chatgpt_session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"custom_payment_methods": [method_id]}),
-        ])
-        flaky_stripe = FlakyElementsSession([])
-        recovered_stripe = FakeSession([
-            FakeResponse({
-                "custom_payment_method_data": [{
-                    "type": method_id,
-                    "display_name": "Localized wallet label",
-                }],
-            }),
-        ])
-        factories = []
-
-        def factory(**kwargs):
-            factories.append(kwargs)
-            return [chatgpt_session, flaky_stripe, recovered_stripe][len(factories) - 1]
-
-        result = probe_gcash("access-token", session_factory=factory)
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(
-            [item["impersonate"] for item in factories],
-            ["chrome146", "firefox144", "chrome110"],
-        )
-        self.assertEqual(result["custom_method_probe_status"], "accepted")
-
-    def test_probe_sends_source_promotion_and_tax_requests(self):
-        checkout = {
-            "checkout_session_id": "cs_test_method_only",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse(_gcash_payload()),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 4)
-        self.assertEqual(session.calls[0][1], "https://chatgpt.com/backend-api/payments/checkout")
-        self.assertTrue(session.calls[0][2]["json"]["check_card_proxy"])
-        self.assertEqual(
-            session.calls[0][2]["json"]["promo_campaign"]["promo_campaign_id"],
-            "plus-1-month-free",
-        )
-        urls = [url for _, url, _ in session.calls]
-        self.assertTrue(any(url.endswith("/payments/checkout/update") for url in urls))
-        self.assertTrue(any(url.endswith("/payments/checkout/taxes") for url in urls))
-
-    def test_checkout_uses_the_source_ph_payment_contract(self):
-        """GCash capability is evaluated against the Philippines checkout."""
-        checkout = {
-            "checkout_session_id": "cs_test_inferred_country",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_inferred_country",
-            "billing_details": {"country": "PH", "currency": "PHP"},
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"payment_method_types": ["card"]}),
-            FakeResponse({"payment_method_types": ["card"]}),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            proxy="http://proxy.example:8080",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        checkout_payload = session.calls[0][2]["json"]
-        self.assertEqual(
-            checkout_payload["billing_details"],
-            {"country": "PH", "currency": "PHP"},
-        )
-        self.assertIn("promo_campaign", checkout_payload)
         self.assertEqual(result["checkout_country"], "PH")
         self.assertEqual(result["currency"], "PHP")
+        self.assertEqual(factories[0]["proxy"], "http://proxy.vn:8080")
+        self.assertEqual(factories[1]["proxy"], "http://proxy.vn:8080")
         self.assertEqual(
-            session.calls[-1][2]["data"]["browser_timezone"],
-            "Asia/Manila",
+            stripe.calls[0][2]["params"]["locale"],
+            "en-US",
         )
-
-    def test_incomplete_capability_response_is_unavailable_not_unknown(self):
-        checkout = {
-            "checkout_session_id": "cs_test_incomplete_capability",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_incomplete_capability",
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({}, status_code=503),
-            FakeResponse({}, status_code=503),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
+        self.assertEqual(
+            stripe.calls[0][2]["params"]["_stripe_version"],
+            "2025-03-31.basil",
         )
+        self.assertNotIn("browser_timezone", stripe.calls[0][2]["params"])
+        self.assertFalse(any(
+            "client_betas" in key for key in stripe.calls[0][2]["params"]
+        ))
 
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertTrue(result["conclusive"])
-        self.assertEqual(result["decision"], "gcash_evidence_incomplete")
+    def test_forbidden_payment_stages_are_never_called(self):
+        result, chatgpt, stripe, _ = run_probe()
+        urls = [url for _, url, _ in [*chatgpt.calls, *stripe.calls]]
 
-    def test_resolve_auth_failure_is_not_hidden_by_later_stripe_failure(self):
-        checkout = {
-            "checkout_session_id": "cs_test_resolve_auth_failure",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_resolve_auth_failure",
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({}, status_code=401),
-            FakeResponse({}, status_code=503),
+        self.assertEqual(result["classification"], "eligible")
+        self.assertFalse(any(
+            any(fragment in url for fragment in (
+                "/checkout/update", "/checkout/taxes", "/payment_pages/",
+                "/confirm", "/subscribe", "/payment_intents",
+                "/custom_payment_method/start", "/resolve",
+            ))
+            for url in urls
+        ))
+
+    def test_result_does_not_expose_tokens_secrets_ids_or_proxy(self):
+        result, _, _, _ = run_probe()
+        serialized = repr(result).lower()
+
+        for secret in (
+            "access-token", "pk_synthetic", "cuss_synthetic",
+            "cpmt_", "proxy.test", "checkout_session_id",
+        ):
+            self.assertNotIn(secret, serialized)
+
+    def test_accounts_check_failure_keeps_plus_and_gcash_results_safe(self):
+        chatgpt = _Session([
+            _Response({}, status_code=503),
+            _Response(checkout_payload()),
         ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["label"], "GCash unavailable")
-        self.assertEqual(result["status"], "token_invalid")
-        self.assertEqual(result["decision"], "resolve_http_401")
-
-    def test_billing_country_mismatch_is_unavailable_not_unknown(self):
-        session = FakeSession([
-            FakeResponse(
-                {"detail": "Billing country must match request country."},
-                status_code=400,
-            )
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertFalse(result["eligible"])
-        self.assertTrue(result["conclusive"])
-        self.assertEqual(result["decision"], "checkout_billing_country_mismatch")
-
-    def test_checkout_400_reason_is_reduced_to_a_safe_stable_code(self):
-        cases = (
-            ("User is already paid", "checkout_already_paid"),
-            ("Invalid account context", "checkout_account_invalid"),
-            ("Invalid checkout session", "checkout_session_invalid"),
-            ("Request rejected by policy", "checkout_http_400"),
-        )
-        for detail, expected in cases:
-            with self.subTest(detail=detail):
-                session = FakeSession([
-                    FakeResponse({"detail": detail}, status_code=400),
-                    FakeResponse({"detail": detail}, status_code=400),
-                ])
-                result = probe_gcash(
-                    "access-token",
-                    session_factory=lambda **_: session,
-                )
-                self.assertEqual(result["decision"], expected)
-                self.assertNotIn(detail, repr(result))
-
-    def test_checkout_promotion_rejection_still_uses_minimal_retry(self):
-        rich_checkout = FakeSession([
-            FakeResponse({"detail": "Invalid promotion"}, status_code=400),
-        ])
-        minimal_checkout = FakeSession([
-            FakeResponse({"checkout_session_id": "invalid"}),
-        ])
-        sessions = [rich_checkout, minimal_checkout]
-        factories = []
+        stripe = _Session([_Response(stripe_payload())])
+        sessions = [chatgpt, stripe]
 
         def factory(**kwargs):
-            factories.append(kwargs)
             return sessions.pop(0)
 
-        result = probe_gcash(
+        workflow = probe_checkout_eligibility(
             "access-token",
-            proxy="http://ph-proxy.example:8080",
+            proxy="http://proxy.test:8080",
             session_factory=factory,
         )
 
-        self.assertEqual(result["decision"], "checkout_session_missing")
-        self.assertEqual(len(factories), 2)
-        retry_payload = minimal_checkout.calls[0][2]["json"]
-        self.assertNotIn("promo_campaign", retry_payload)
-        self.assertNotIn("check_card_proxy", retry_payload)
-
-    def test_explicit_checkout_evidence_survives_resolve_failure(self):
-        checkout = {
-            "checkout_session_id": "cs_test_resolve_failure",
-            "processor_entity": "openai_ie",
-            **_gcash_payload(),
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"message": "temporary"}, status_code=503),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(len(session.calls), 4)
-
-    def test_probe_stops_before_any_payment_execution_endpoint(self):
-        checkout = {
-            "checkout_session_id": "cs_test_safe_probe",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_safe",
-            "customer_session_client_secret": "cuss_secret_not_returned",
-            **_gcash_payload(),
-        }
-        resolved = _gcash_payload()
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse(resolved),
-        ])
-        factory_calls = []
-
-        def factory(*, proxy=None, impersonate=""):
-            factory_calls.append({"proxy": proxy, "impersonate": impersonate})
-            return session
-
-        result = probe_gcash(
-            "access-token-secret",
-            account_id="account-a",
-            device_id="device-a",
-            cookie_header="session=secret-cookie",
-            proxy="socks5://proxy-user:proxy-pass@example.test:1080",
-            session_factory=factory,
-            checked_at=99.0,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(factory_calls[0]["proxy"], "socks5://proxy-user:proxy-pass@example.test:1080")
-        self.assertTrue(session.closed)
-        urls = [url for _, url, _ in session.calls]
-        # A transport failure on the isolated Stripe capability session may
-        # trigger one bounded retry; neither attempt may enter a payment stage.
-        self.assertGreaterEqual(len(urls), 5)
-        self.assertLessEqual(len(urls), 6)
-        self.assertTrue(any(url.endswith("/payments/checkout") for url in urls))
-        self.assertTrue(any("/payments/checkout/openai_ie/cs_test_safe_probe" in url for url in urls))
-        self.assertFalse(any("confirm" in url or "custom_payment_method/start" in url for url in urls))
-        self.assertTrue(all(call[2]["allow_redirects"] is False for call in session.calls))
-        serialized = repr(result)
-        self.assertNotIn("access-token-secret", serialized)
-        self.assertNotIn("secret-cookie", serialized)
-        self.assertNotIn("cuss_secret_not_returned", serialized)
-        self.assertNotIn("cs_test_safe_probe", serialized)
-        self.assertNotIn("proxy-pass", serialized)
-
-    def test_payment_pages_init_is_used_when_no_custom_id_is_returned(self):
-        checkout = {
-            "checkout_session_id": "cs_test_standard_methods",
-            "processor_entity": "openai_ie",
-            "publishable_key": "pk_test_standard",
-        }
-        session = FakeSession([
-            FakeResponse(checkout),
-            FakeResponse({"payment_method_types": ["card"]}),
-            FakeResponse({"payment_method_types": ["card", "gcash"]}),
-        ])
-
-        result = probe_gcash(
-            "access-token",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "eligible")
-        self.assertEqual(session.calls[-1][0], "POST")
-        self.assertEqual(
-            session.calls[-1][1],
-            "https://api.stripe.com/v1/payment_pages/cs_test_standard_methods/init",
-        )
-
-    def test_transport_error_is_unavailable_and_redacted(self):
-        class BrokenSession(FakeSession):
-            def post(self, url, **kwargs):
-                raise RuntimeError(
-                    "connect failed via http://user:password@proxy.example and Bearer token-secret"
-                )
-
-        session = BrokenSession([])
-        result = probe_gcash(
-            "token-secret",
-            proxy="http://user:password@proxy.example",
-            session_factory=lambda **_: session,
-        )
-
-        self.assertEqual(result["classification"], "ineligible")
-        self.assertEqual(result["label"], "GCash unavailable")
-        self.assertEqual(result["decision"], "checkout_transport_error")
-        self.assertTrue(result["retryable"])
-        self.assertNotIn("password", repr(result))
-        self.assertNotIn("token-secret", repr(result))
+        self.assertEqual(workflow["gcash"]["classification"], "eligible")
+        self.assertEqual(workflow["plus"]["status"], "error")
 
 
 if __name__ == "__main__":

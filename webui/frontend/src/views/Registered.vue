@@ -105,8 +105,8 @@ async function doGCashCheck() {
   if (!emails.length) { ElMessage.info('Select at least one account'); return }
   const approved = await confirm(
     `Check GCash availability for ${emails.length} selected account(s)?\n\n` +
-    'This creates a PH/PHP checkout, applies the Plus campaign, synchronizes taxes, and reads payment-method capability metadata.\n' +
-    'A Philippines proxy is required because the checkout billing country is PH.\n' +
+    'This creates a read-only PH/PHP checkout, applies the Plus campaign, and reads Stripe payment-method capability metadata.\n' +
+    'The same selected proxy is used for ChatGPT and Stripe; this workflow does not require a Philippines proxy.\n' +
     'It never confirms the checkout, starts a custom payment method, or executes payment.',
   )
   if (!approved) return
@@ -114,10 +114,14 @@ async function doGCashCheck() {
   gcashChecking.value = true
   gcashResult.value = `Checking GCash availability... (${emails.length})`
   try {
-    const { results } = await checkGCash(emails, proxyText(form.value))
+    const { results, plus_results: plusResults } = await checkGCash(emails, proxyText(form.value))
     for (const [email, info] of Object.entries(results || {})) {
       const row = rows.value.find((item) => item.email === email)
       if (row) row.gcash_check = info
+    }
+    for (const [email, info] of Object.entries(plusResults || {})) {
+      const row = rows.value.find((item) => item.email === email)
+      if (row && info && Object.keys(info).length) row.plus_check = info
     }
     gcashResult.value = summarizeGCash(results).text
   } catch (error) {
@@ -389,12 +393,12 @@ onActivated(() => load())
         </el-select>
         <el-select
           v-model="form.proxy" filterable clearable allow-create default-first-option
-          :reserve-keyword="false" placeholder="Check proxy (use a PH exit for GCash)"
+          :reserve-keyword="false" placeholder="Check proxy (same route for ChatGPT and Stripe)"
           style="width: 260px"
         >
           <el-option v-for="p in proxyList" :key="p" :label="p" :value="p" />
         </el-select>
-        <span class="hint">GCash uses a PH/PHP checkout; select a Philippines proxy to match it.</span>
+        <span class="hint">GCash uses a PH/PHP checkout; the selected proxy does not need a Philippines exit.</span>
         <el-button :loading="checking" @click="doCheck('unchecked')">Check unchecked</el-button>
         <el-button :loading="checking" @click="doCheck('all')">Recheck page</el-button>
         <el-button :loading="checking" :disabled="!selected.length" @click="doCheck('selected')">

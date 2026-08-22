@@ -231,6 +231,19 @@ class GCashEligibilityApiTests(unittest.TestCase):
         result = response.json()["results"]["person@example.com"]
         self.assertEqual(result["decision"], "account_not_found")
 
+    def test_account_not_found_returns_both_verdicts_without_writing_a_missing_row(self):
+        with patch("webui.app.db.get_registered", return_value=None), \
+             patch("webui.app.db.update_eligibility_check") as persist:
+            response = api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        email = "person@example.com"
+        self.assertEqual(response["plus_results"][email]["decision"], "account_not_found")
+        self.assertEqual(response["results"][email]["decision"], "account_not_found")
+        persist.assert_not_called()
+
     def test_deduplicates_emails_and_returns_structured_results(self):
         credential = {
             "email": "person@example.com",

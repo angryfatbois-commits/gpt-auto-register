@@ -25,7 +25,7 @@ export function summarizeGCash(results) {
 export function gcashDisplayLabel(check) {
   if (!check) return ''
   return check.classification === 'eligible' || check.eligible === true ||
-    check.method_available === true || check.label === 'GCash eligible' ||
+    check.label === 'GCash eligible' ||
     check.label === 'GCash available'
     ? 'GCash available'
     : 'GCash unavailable'
@@ -60,6 +60,11 @@ export function formatGCashDetail(check, formatTime = (value) => String(value)) 
   if (probeException) parts.push(`Exception: ${probeException}`)
   if (check.checkout_country || check.currency) {
     parts.push(`Checkout: ${[check.checkout_country, check.currency].filter(Boolean).join(' / ')}`)
+  }
+  if (check.amount_status === 'zero' || check.amount_status === 'positive') {
+    const currency = String(check.currency || '').toUpperCase()
+    parts.push(`Due: ${currency || 'Minor units'} ${check.amount_minor}`)
+    parts.push(`Zero payment: ${check.zero_payment ? 'Yes' : 'No'}`)
   }
   if (check.checked_at) parts.push(`Checked: ${formatTime(check.checked_at)}`)
   return parts.join(' · ')

@@ -12,6 +12,34 @@ from webui import db
 
 
 class EligibilityPersistenceTests(unittest.TestCase):
+    def test_persists_sanitized_zero_payment_and_due_fields(self):
+        email = "amount@example.com"
+        db.save_registered({"email": email, "access_token": "access-token"})
+
+        db.update_eligibility_check(email, "gcash_check", {
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "gcash_available",
+            "status": "eligible",
+            "label": "GCash available",
+            "amount_minor": 0,
+            "currency": "PHP",
+            "checkout_country": "PH",
+            "zero_payment": True,
+            "amount_status": "zero",
+            "customer_session_client_secret": "must-not-persist",
+            "custom_method_id": "cpmt_must_not_persist",
+        })
+
+        stored = db.list_registered()[0]["gcash_check"]
+
+        self.assertEqual(stored["amount_minor"], 0)
+        self.assertIs(stored["zero_payment"], True)
+        self.assertEqual(stored["amount_status"], "zero")
+        self.assertNotIn("must-not-persist", repr(stored))
+        self.assertNotIn("cpmt_", repr(stored))
+
     def setUp(self):
         self._original_db_path = db.DB_PATH
         self._temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
