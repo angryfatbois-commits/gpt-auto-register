@@ -764,7 +764,44 @@ _SAFE_ELIGIBILITY_FIELDS = frozenset({
     "amount_minor", "currency", "checkout_country", "check_scope", "method_evidence_present",
     "trusted_custom_method_matched", "custom_method_probe_status",
     "custom_method_probe_failure", "custom_method_probe_exception",
+    "auth_refresh_status",
 })
+_SENSITIVE_EXTRA_KEYS = frozenset({
+    "accesstoken",
+    "apikey",
+    "authorization",
+    "bearer",
+    "cookie",
+    "cookieheader",
+    "credential",
+    "credentials",
+    "headers",
+    "idtoken",
+    "password",
+    "proxy",
+    "proxyurl",
+    "rawbody",
+    "rawresponse",
+    "refreshtoken",
+    "requestbody",
+    "requestheaders",
+    "responsebody",
+    "responseheaders",
+    "secret",
+    "sessiontoken",
+    "token",
+    "totpsecret",
+})
+_SENSITIVE_EXTRA_KEY_SUFFIXES = (
+    "apikey",
+    "bearer",
+    "credential",
+    "credentials",
+    "password",
+    "proxy",
+    "secret",
+    "token",
+)
 
 
 def _safe_eligibility_result(value: dict) -> dict:
@@ -777,15 +814,54 @@ def _safe_eligibility_result(value: dict) -> dict:
     }
 
 
+def _safe_stored_eligibility_result(value: dict, *, gcash: bool = False) -> dict:
+    source = normalize_gcash_result(value) if gcash else dict(value)
+    safe = _safe_eligibility_result(source)
+    last = value.get("last_conclusive")
+    if isinstance(last, dict):
+        safe["last_conclusive"] = _safe_eligibility_result(
+            normalize_gcash_result(last) if gcash else last
+        )
+    return safe
+
+
+def _is_sensitive_extra_key(key: object) -> bool:
+    canonical = "".join(
+        character for character in str(key).strip().casefold()
+        if character.isalnum()
+    )
+    return (
+        canonical in _SENSITIVE_EXTRA_KEYS
+        or canonical.endswith(_SENSITIVE_EXTRA_KEY_SUFFIXES)
+    )
+
+
+def _sanitize_extra_value(value: object) -> object:
+    if isinstance(value, dict):
+        return {
+            str(key): _sanitize_extra_value(item)
+            for key, item in value.items()
+            if not _is_sensitive_extra_key(key)
+        }
+    if isinstance(value, list):
+        return [_sanitize_extra_value(item) for item in value]
+    return value
+
+
 def _normalize_extra_gcash(extra: object) -> object:
-    """Normalize a stored GCash result on every read surface."""
+    """Normalize and re-sanitize eligibility results on every read surface."""
     if not isinstance(extra, dict):
         return extra
+    normalized = _sanitize_extra_value(extra)
+    plus = extra.get("plus_check")
+    if isinstance(plus, dict):
+        normalized["plus_check"] = _safe_stored_eligibility_result(plus)
     gcash = extra.get("gcash_check")
-    if not isinstance(gcash, dict):
-        return extra
-    normalized = dict(extra)
-    normalized["gcash_check"] = normalize_gcash_result(gcash)
+    if isinstance(gcash, dict):
+        normalized["gcash_check"] = _safe_stored_eligibility_result(
+            gcash,
+            gcash=True,
+        )
     return normalized
 
 

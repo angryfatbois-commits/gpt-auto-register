@@ -9,6 +9,8 @@ custom-payment start, or any payment execution operation.
 
 from __future__ import annotations
 
+import base64
+import json
 import logging
 import os
 import re
@@ -41,6 +43,8 @@ _CHATGPT_SEC_CH_UA = (
 )
 _CHATGPT_CLIENT_VERSION = "prod-fb4a8a2a751dfec391053cfd7b01c52699ccf78c"
 _CHATGPT_CLIENT_BUILD = "8370486"
+_ACCESS_TOKEN_ISSUER = "https://auth.openai.com"
+_ACCESS_TOKEN_AUDIENCE = "https://api.openai.com/v1"
 _FIREFOX_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:144.0) "
     "Gecko/20100101 Firefox/144.0"
@@ -112,6 +116,30 @@ _IDENTIFIER_KEYS = frozenset({
     "custom_payment_method_type_id",
     "payment_method_type_id",
 })
+_PAYMENT_COOKIE_NAMES = frozenset({
+    "oai-did",
+    "oai-hlib",
+    "oai-sc",
+    "oaicom-stable-id",
+    "_account",
+    "_account_is_fedramp",
+    "__Secure-oai-is",
+    "__Secure-next-auth.session-token",
+    "__cf_bm",
+    "__cflb",
+    "_cfuvid",
+    "__oailb",
+    "cf_clearance",
+})
+_SAFE_DIAGNOSTIC_JSON_KEYS = frozenset({
+    "code",
+    "detail",
+    "error",
+    "error_code",
+    "message",
+    "status",
+    "type",
+})
 
 
 class _ProbeFailure(RuntimeError):
@@ -122,6 +150,7 @@ class _ProbeFailure(RuntimeError):
         retryable: bool,
         status_code: int = 0,
         exception_type: str = "",
+        diagnostics: Mapping[str, Any] | None = None,
     ) -> None:
         super().__init__(code)
         self.code = code
@@ -133,10 +162,180 @@ class _ProbeFailure(RuntimeError):
             if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", safe_type)
             else ""
         )
+        self.diagnostics = dict(diagnostics or {})
 
 
 def _checked_at(value: float | None) -> float:
     return float(time.time() if value is None else value)
+
+
+def _safe_identity_value(value: Any, *, max_length: int = 256) -> str:
+    text = str(value or "").strip()
+    if len(text) > max_length or not re.fullmatch(r"[A-Za-z0-9_-]+", text):
+        return ""
+    return text
+
+
+def _valid_access_token(value: str) -> bool:
+    token = str(value or "")
+    return bool(token) and len(token) <= 65536 and all(
+        0x21 <= ord(char) <= 0x7E for char in token
+    )
+
+
+def _decode_jwt_payload(token: str) -> dict[str, Any]:
+    return _decode_jwt_part(token, 1)
+
+
+def _decode_jwt_part(token: str, index: int) -> dict[str, Any]:
+    try:
+        parts = str(token or "").split(".")
+        if len(parts) <= index:
+            return {}
+        payload = parts[index]
+        padding = "=" * ((4 - len(payload) % 4) % 4)
+        data = json.loads(base64.urlsafe_b64decode(payload + padding))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _jwt_account_id(token: str) -> str:
+    payload = _decode_jwt_payload(token)
+    auth = payload.get("https://api.openai.com/auth")
+    if not isinstance(auth, Mapping):
+        return ""
+    return str(auth.get("chatgpt_account_id") or auth.get("account_id") or "").strip()
+
+
+def _jwt_audiences(payload: Mapping[str, Any]) -> set[str]:
+    raw = payload.get("aud")
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    return {str(value or "").strip() for value in values if str(value or "").strip()}
+
+
+def _refreshed_token_claims_match(token: str, previous_token: str) -> bool:
+    """Correlate a same-origin refresh token with the stored account session.
+
+    Authenticity still comes from the fixed HTTPS `/api/auth/session` endpoint
+    with certificate validation and redirects disabled. These decoded claims
+    are defense-in-depth correlation checks, never an authorization decision.
+    """
+    header = _decode_jwt_part(token, 0)
+    payload = _decode_jwt_payload(token)
+    if (
+        header.get("alg") != "RS256"
+        or not str(header.get("kid") or "").strip()
+        or str(header.get("typ") or "JWT").upper() != "JWT"
+        or payload.get("iss") != _ACCESS_TOKEN_ISSUER
+        or _ACCESS_TOKEN_AUDIENCE not in _jwt_audiences(payload)
+        or not str(payload.get("sub") or "").strip()
+        or not str(payload.get("client_id") or "").strip()
+    ):
+        return False
+    now = time.time()
+    try:
+        issued_at = float(payload.get("iat"))
+        expires_at = float(payload.get("exp"))
+        not_before = float(payload.get("nbf") or issued_at)
+    except (TypeError, ValueError):
+        return False
+    if issued_at > now + 300 or not_before > now + 300 or expires_at <= now:
+        return False
+
+    previous_header = _decode_jwt_part(previous_token, 0)
+    previous = _decode_jwt_payload(previous_token)
+    if (
+        previous_header.get("alg") != "RS256"
+        or not str(previous_header.get("kid") or "").strip()
+        or previous.get("iss") != _ACCESS_TOKEN_ISSUER
+        or _ACCESS_TOKEN_AUDIENCE not in _jwt_audiences(previous)
+        or not str(previous.get("sub") or "").strip()
+        or not str(previous.get("client_id") or "").strip()
+    ):
+        return False
+    for key in ("iss", "sub", "client_id"):
+        if str(payload.get(key) or "").strip() != str(previous.get(key) or "").strip():
+            return False
+    if _jwt_audiences(payload) != _jwt_audiences(previous):
+        return False
+    return True
+
+
+def _cookie_pairs(cookie_header: str) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    for item in str(cookie_header or "").split(";"):
+        name, separator, value = item.strip().partition("=")
+        if separator and name:
+            pairs[name] = value
+    return pairs
+
+
+def _safe_cookie_pair(name: str, value: str) -> bool:
+    if not re.fullmatch(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+", str(name or "")):
+        return False
+    return bool(
+        re.fullmatch(
+            r"[\x21\x23-\x2B\x2D-\x3A\x3C-\x5B\x5D-\x7E]+",
+            str(value or ""),
+        )
+    )
+
+
+def _has_session_cookie(cookie_header: str) -> bool:
+    value = _cookie_pairs(cookie_header).get("__Secure-next-auth.session-token", "")
+    return _safe_cookie_pair("__Secure-next-auth.session-token", value)
+
+
+def _sanitize_cookie_header(cookie_header: str, *, device_id: str) -> str:
+    pairs = {
+        name: value
+        for name, value in _cookie_pairs(cookie_header).items()
+        if _safe_cookie_pair(name, value)
+    }
+    stable_device = str(device_id or "").strip()
+    if pairs and _safe_cookie_pair("oai-did", stable_device):
+        pairs["oai-did"] = stable_device
+    return "; ".join(f"{name}={value}" for name, value in pairs.items())
+
+
+def _cookie_jar_pairs(cookies: Any) -> dict[str, str]:
+    pairs: dict[str, str] = {}
+    try:
+        for name, value in cookies.items():
+            key = str(name or "").strip()
+            if key:
+                pairs[key] = str(value or "")
+    except Exception:
+        pass
+    return pairs
+
+
+def _clear_cookie_jar(cookies: Any) -> None:
+    try:
+        cookies.clear()
+    except Exception:
+        pass
+
+
+def _merge_payment_cookies(
+    base_cookie_header: str,
+    cookies: Any,
+    *,
+    device_id: str,
+) -> str:
+    pairs = {
+        name: value
+        for name, value in _cookie_pairs(base_cookie_header).items()
+        if _safe_cookie_pair(name, value)
+    }
+    for name, value in _cookie_jar_pairs(cookies).items():
+        if name in _PAYMENT_COOKIE_NAMES and _safe_cookie_pair(name, value):
+            pairs[name] = value
+    stable_device = str(device_id or "").strip()
+    if stable_device:
+        pairs["oai-did"] = stable_device
+    return "; ".join(f"{name}={value}" for name, value in pairs.items() if name and value)
 
 
 def normalize_gcash_result(value: Mapping[str, Any]) -> dict[str, Any]:
@@ -677,11 +876,106 @@ def _safe_rejection_code(stage: str, body: Any) -> str:
     return ""
 
 
+def _media_family(headers: Any) -> str:
+    try:
+        content_type = str(headers.get("content-type") or headers.get("Content-Type") or "")
+    except Exception:
+        content_type = ""
+    token = content_type.split(";", 1)[0].strip().lower()
+    if token == "application/json" or token.endswith("+json"):
+        return "json"
+    if token in {"text/html", "application/xhtml+xml"}:
+        return "html"
+    if token.startswith("text/"):
+        return "text"
+    return "other"
+
+
+def _length_bucket(response: Any) -> str:
+    raw = ""
+    try:
+        raw = str(getattr(response, "text", "") or "")
+    except Exception:
+        raw = ""
+    if not raw:
+        try:
+            payload = response.json()
+            raw = json.dumps(payload, separators=(",", ":"))
+        except Exception:
+            raw = ""
+    length = len(raw.encode("utf-8", errors="ignore"))
+    if length < 1024:
+        return "lt_1kb"
+    if length < 10 * 1024:
+        return "lt_10kb"
+    if length < 100 * 1024:
+        return "lt_100kb"
+    return "gte_100kb"
+
+
+def _json_key_shape(body: Any) -> str:
+    if not isinstance(body, Mapping):
+        return "none other_keys=0"
+    raw_keys = [str(item or "").strip().lower() for item in body.keys()]
+    safe_keys = sorted({key for key in raw_keys if key in _SAFE_DIAGNOSTIC_JSON_KEYS})
+    other_count = sum(1 for key in raw_keys if key not in _SAFE_DIAGNOSTIC_JSON_KEYS)
+    return f"{','.join(safe_keys) or 'none'} other_keys={other_count}"
+
+
+def _safe_response_diagnostics(response: Any) -> dict[str, str]:
+    media = _media_family(getattr(response, "headers", {}) or {})
+    body: Any = None
+    try:
+        body = response.json()
+    except Exception:
+        body = None
+    if media == "other" and isinstance(body, (Mapping, list, tuple)):
+        media = "json"
+    return {
+        "media": media,
+        "keys": _json_key_shape(body),
+        "length_bucket": _length_bucket(response),
+    }
+
+
+def _safe_diagnostics_enabled() -> bool:
+    return str(os.getenv("GCASH_SAFE_DIAGNOSTICS", "")).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+
+
+def _log_auth_refresh_status(status: str) -> None:
+    if not _safe_diagnostics_enabled():
+        return
+    safe_status = str(status or "").strip()
+    if not re.fullmatch(r"[a-z][a-z0-9_]{0,63}", safe_status):
+        safe_status = "failed"
+    _LOGGER.info("[gcash_probe] auth refresh status=%s", safe_status)
+
+
+def _log_checkout_diagnostics(attempt: str, failure: _ProbeFailure) -> None:
+    if not _safe_diagnostics_enabled():
+        return
+    safe_attempt = "minimal" if attempt == "minimal" else "rich"
+    diagnostics = failure.diagnostics
+    _LOGGER.info(
+        "[gcash_probe] checkout diagnostic attempt=%s media=%s keys=%s length_bucket=%s",
+        safe_attempt,
+        diagnostics.get("media") or "other",
+        diagnostics.get("keys") or "none other_keys=0",
+        diagnostics.get("length_bucket") or "lt_1kb",
+    )
+
+
 def _json_response(response: Any, stage: str) -> Mapping[str, Any]:
     status_code = int(getattr(response, "status_code", 0) or 0)
     if not 200 <= status_code < 300:
         retryable = status_code in {408, 425, 429} or status_code >= 500
         code = f"{stage}_http_{status_code}"
+        diagnostics = _safe_response_diagnostics(response)
         if status_code in {400, 422}:
             # Keep only a stable, non-sensitive reason code. The response body
             # is never returned or persisted.
@@ -690,7 +984,12 @@ def _json_response(response: Any, stage: str) -> Mapping[str, Any]:
             except Exception:
                 body = None
             code = _safe_rejection_code(stage, body) or code
-        raise _ProbeFailure(code, retryable=retryable, status_code=status_code)
+        raise _ProbeFailure(
+            code,
+            retryable=retryable,
+            status_code=status_code,
+            diagnostics=diagnostics,
+        )
     try:
         payload = response.json()
     except Exception as exc:
@@ -778,6 +1077,82 @@ def _get_json(
             exception_type=type(exc).__name__,
         ) from exc
     return _json_response(response, stage)
+
+
+def _auth_session_refresh(
+    session: Any,
+    *,
+    access_token: str,
+    expected_account_id: str,
+    device_id: str,
+    cookie_header: str,
+    session_id: str,
+    timeout: int,
+) -> tuple[str, str, str]:
+    if not _has_session_cookie(cookie_header):
+        return access_token, cookie_header, "not_requested"
+
+    headers = _chatgpt_headers(
+        access_token,
+        account_id=expected_account_id,
+        device_id=device_id,
+        cookie_header=cookie_header,
+        route="/api/auth/session",
+        session_id=session_id,
+    )
+    headers["Accept"] = "application/json"
+    headers.pop("Authorization", None)
+    headers.pop("ChatGPT-Account-Id", None)
+    headers.pop("Content-Type", None)
+    headers.pop("x-openai-target-path", None)
+    headers.pop("x-openai-target-route", None)
+    try:
+        try:
+            response = session.get(
+                "https://chatgpt.com/api/auth/session",
+                headers=headers,
+                timeout=timeout,
+                allow_redirects=False,
+            )
+            payload = _json_response(response, "auth_session")
+        except _ProbeFailure as exc:
+            return access_token, cookie_header, exc.code
+        except Exception:
+            return access_token, cookie_header, "failed"
+
+        refreshed_token = str(
+            payload.get("accessToken") or payload.get("access_token") or ""
+        ).strip()
+        if not refreshed_token:
+            return access_token, cookie_header, "no_token"
+        if not _valid_access_token(refreshed_token):
+            return access_token, cookie_header, "token_invalid"
+
+        expected = str(expected_account_id or "").strip()
+        if not expected:
+            return access_token, cookie_header, "token_unbound"
+        stored_account = _jwt_account_id(access_token)
+        if stored_account and stored_account != expected:
+            return access_token, cookie_header, "token_unbound"
+        if not _refreshed_token_claims_match(refreshed_token, access_token):
+            return access_token, cookie_header, "token_claim_mismatch"
+        observed = _jwt_account_id(refreshed_token)
+        if not observed:
+            return access_token, cookie_header, "token_unparseable"
+        if observed != expected:
+            return access_token, cookie_header, "token_account_mismatch"
+
+        refreshed_cookie = _merge_payment_cookies(
+            cookie_header,
+            getattr(session, "cookies", None),
+            device_id=device_id,
+        )
+        return refreshed_token, refreshed_cookie or cookie_header, "refreshed"
+    finally:
+        # Every later ChatGPT POST uses an explicit cookie header. Clearing the
+        # jar prevents a failed or cross-account refresh from being merged into
+        # the resolve GET by the reusable transport.
+        _clear_cookie_jar(getattr(session, "cookies", None))
 
 
 def _checkout_session(payload: Mapping[str, Any]) -> tuple[str, str]:
@@ -1057,8 +1432,17 @@ def probe_gcash(
             label="No access token",
             checked_at=checked_at,
         )
+    if not _valid_access_token(token):
+        return gcash_probe_error(
+            "invalid_access_token",
+            retryable=False,
+            status="token_invalid",
+            label="Access token invalid",
+            checked_at=checked_at,
+        )
     timeout = max(5, min(int(timeout or 30), 60))
-    stable_device_id = str(device_id or "").strip() or str(uuid.uuid4())
+    account_id = _safe_identity_value(account_id)
+    stable_device_id = _safe_identity_value(device_id, max_length=128) or str(uuid.uuid4())
     stable_session_id = str(uuid.uuid4())
     if session_factory is None:
         from http_client import create_http_session
@@ -1074,18 +1458,40 @@ def probe_gcash(
     custom_capability_response_id_count = 0
     custom_capability_failure_codes: list[str] = []
     custom_capability_failure_types: list[str] = []
+    auth_refresh_status = "not_requested"
+    checkout_token = token
+    checkout_cookie = _sanitize_cookie_header(
+        str(cookie_header or "").strip(),
+        device_id=stable_device_id,
+    )
+
+    def _attach_auth_status(result: Mapping[str, Any]) -> dict[str, Any]:
+        enriched = dict(result)
+        enriched["auth_refresh_status"] = auth_refresh_status
+        return enriched
+
     try:
         session = session_factory(
             proxy=str(proxy or "").strip() or None,
             impersonate=_CHATGPT_IMPERSONATE,
         )
+        checkout_token, checkout_cookie, auth_refresh_status = _auth_session_refresh(
+            session,
+            access_token=checkout_token,
+            expected_account_id=account_id,
+            device_id=stable_device_id,
+            cookie_header=checkout_cookie,
+            session_id=stable_session_id,
+            timeout=timeout,
+        )
+        _log_auth_refresh_status(auth_refresh_status)
         checkout_route = "/backend-api/payments/checkout"
         stage = "checkout"
         checkout_headers = _chatgpt_headers(
-            token,
+            checkout_token,
             account_id=account_id,
             device_id=stable_device_id,
-            cookie_header=cookie_header,
+            cookie_header=checkout_cookie,
             route=checkout_route,
             session_id=stable_session_id,
         )
@@ -1113,6 +1519,7 @@ def probe_gcash(
                 "checkout_promotion_rejected",
             }:
                 raise
+            _log_checkout_diagnostics("rich", exc)
             _LOGGER.info(
                 "[gcash_probe] checkout compatibility retry reason=%s",
                 exc.code,
@@ -1125,14 +1532,26 @@ def probe_gcash(
                 proxy=str(proxy or "").strip() or None,
                 impersonate=_CHATGPT_IMPERSONATE,
             )
-            checkout = _post_json(
-                session,
-                f"{CHATGPT_PAYMENTS_BASE}/checkout",
-                _method_only_checkout_payload(),
-                checkout_headers,
-                timeout,
-                stage,
+            checkout_headers = _chatgpt_headers(
+                checkout_token,
+                account_id=account_id,
+                device_id=stable_device_id,
+                cookie_header=checkout_cookie,
+                route=checkout_route,
+                session_id=stable_session_id,
             )
+            try:
+                checkout = _post_json(
+                    session,
+                    f"{CHATGPT_PAYMENTS_BASE}/checkout",
+                    _method_only_checkout_payload(),
+                    checkout_headers,
+                    timeout,
+                    stage,
+                )
+            except _ProbeFailure as retry_exc:
+                _log_checkout_diagnostics("minimal", retry_exc)
+                raise
         checkout_session_id, processor = _checkout_session(checkout)
         payloads: list[Mapping[str, Any]] = [checkout]
 
@@ -1145,10 +1564,10 @@ def probe_gcash(
         stage = "promotion_update"
         try:
             update_headers = _chatgpt_headers(
-                token,
+                checkout_token,
                 account_id=account_id,
                 device_id=stable_device_id,
-                cookie_header=cookie_header,
+                cookie_header=checkout_cookie,
                 route=update_route,
                 session_id=stable_session_id,
             )
@@ -1172,10 +1591,10 @@ def probe_gcash(
         stage = "taxes"
         try:
             taxes_headers = _chatgpt_headers(
-                token,
+                checkout_token,
                 account_id=account_id,
                 device_id=stable_device_id,
-                cookie_header=cookie_header,
+                cookie_header=checkout_cookie,
                 route=taxes_route,
                 session_id=stable_session_id,
             )
@@ -1207,10 +1626,10 @@ def probe_gcash(
                 session,
                 f"{CHATGPT_PAYMENTS_BASE}/checkout/{processor}/{checkout_session_id}",
                 headers=_chatgpt_headers(
-                    token,
+                    checkout_token,
                     account_id=account_id,
                     device_id=stable_device_id,
-                    cookie_header=cookie_header,
+                    cookie_header=checkout_cookie,
                     route=resolve_route,
                     session_id=stable_session_id,
                 ),
@@ -1220,7 +1639,6 @@ def probe_gcash(
             payloads.append(resolved)
         except _ProbeFailure as exc:
             optional_failures.append(exc)
-            pass
 
         discovered = _evidence(payloads)["custom_method_ids"]
         configured_id = _custom_method_id(os.getenv("GCASH_CUSTOM_PAYMENT_METHOD_ID", ""))
@@ -1371,14 +1789,18 @@ def probe_gcash(
                 None,
             )
             if auth_failure is not None:
-                return gcash_probe_error(
-                    auth_failure.code,
-                    retryable=auth_failure.retryable,
-                    status="token_invalid",
-                    label="Access token invalid",
-                    checked_at=checked_at,
+                return _attach_auth_status(
+                    gcash_probe_error(
+                        auth_failure.code,
+                        retryable=auth_failure.retryable,
+                        status="token_invalid",
+                        label="Access token invalid",
+                        checked_at=checked_at,
+                    )
                 )
-            return gcash_unavailable("gcash_evidence_incomplete", checked_at=checked_at)
+            return _attach_auth_status(
+                gcash_unavailable("gcash_evidence_incomplete", checked_at=checked_at)
+            )
         result = classify_gcash_evidence(
             payloads,
             require_zero=require_zero,
@@ -1397,22 +1819,28 @@ def probe_gcash(
             if custom_capability_failure_types
             else ""
         )
-        return result
+        return _attach_auth_status(result)
     except _ProbeFailure as exc:
         if exc.status_code in {400, 422}:
-            return gcash_unavailable(exc.code, checked_at=checked_at)
+            return _attach_auth_status(
+                gcash_unavailable(exc.code, checked_at=checked_at)
+            )
         status = "token_invalid" if exc.code.endswith(("http_401", "http_403")) else "error"
-        return gcash_probe_error(
-            exc.code,
-            retryable=exc.retryable,
-            status=status,
-            checked_at=checked_at,
+        return _attach_auth_status(
+            gcash_probe_error(
+                exc.code,
+                retryable=exc.retryable,
+                status=status,
+                checked_at=checked_at,
+            )
         )
     except Exception:
-        return gcash_probe_error(
-            f"{stage}_unexpected_error",
-            retryable=True,
-            checked_at=checked_at,
+        return _attach_auth_status(
+            gcash_probe_error(
+                f"{stage}_unexpected_error",
+                retryable=True,
+                checked_at=checked_at,
+            )
         )
     finally:
         if session is not None:

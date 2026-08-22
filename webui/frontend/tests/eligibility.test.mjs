@@ -98,6 +98,23 @@ test('availability detail exposes only sanitized capability diagnostics', () => 
   assert.doesNotMatch(unsafe, /Bearer|secret-token/i)
 })
 
+test('availability detail exposes only a sanitized auth refresh status', () => {
+  const text = formatGCashDetail({
+    classification: 'ineligible',
+    decision: 'checkout_http_400',
+    auth_refresh_status: 'refreshed',
+  })
+
+  assert.match(text, /Session: refreshed/)
+
+  const unsafe = formatGCashDetail({
+    classification: 'ineligible',
+    decision: 'checkout_http_400',
+    auth_refresh_status: 'access-token-secret',
+  })
+  assert.doesNotMatch(unsafe, /access-token-secret/i)
+})
+
 test('legacy stored labels are presented as availability labels', () => {
   assert.equal(gcashDisplayLabel({ label: 'GCash eligible' }), 'GCash available')
   assert.equal(gcashDisplayLabel({ label: 'GCash ineligible' }), 'GCash unavailable')

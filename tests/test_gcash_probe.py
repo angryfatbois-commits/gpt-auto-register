@@ -1,21 +1,29 @@
+import base64
+import json
+import os
 import unittest
+from unittest.mock import patch
 
 
 from gcash_probe import classify_gcash_evidence, probe_gcash
 
 
 class FakeResponse:
-    def __init__(self, payload, status_code=200):
+    def __init__(self, payload, status_code=200, headers=None):
         self._payload = payload
         self.status_code = status_code
+        self.headers = headers or {}
 
     def json(self):
         return self._payload
 
 
 class FakeSession:
-    def __init__(self, responses):
+    def __init__(self, responses, auth_response=None, auth_error=None, cookies=None):
         self.responses = responses
+        self.auth_response = auth_response
+        self.auth_error = auth_error
+        self.cookies = cookies or {}
         self.calls = []
         self.closed = False
         self.isolated_posts = 0
@@ -37,6 +45,10 @@ class FakeSession:
 
     def get(self, url, **kwargs):
         self.calls.append(("GET", url, kwargs))
+        if url == "https://chatgpt.com/api/auth/session":
+            if self.auth_error:
+                raise self.auth_error
+            return self.auth_response if self.auth_response is not None else FakeResponse({})
         return self.responses.pop(0)
 
     def close(self):
@@ -51,6 +63,34 @@ def _gcash_payload(amount=0, currency="php"):
             {"id": "cpmt_live_discovered", "display_name": "GCash"}
         ],
     }
+
+
+def _jwt(payload):
+    def encode(part):
+        raw = json.dumps(part, separators=(",", ":")).encode("utf-8")
+        return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+    return f"{encode({'alg': 'RS256', 'kid': 'test-key', 'typ': 'JWT'})}.{encode(payload)}.signature"
+
+
+def _account_token(
+    account_id,
+    *,
+    issuer="https://auth.openai.com",
+    subject="user-stable",
+    issued_at=1,
+):
+    return _jwt({
+        "iss": issuer,
+        "aud": ["https://api.openai.com/v1"],
+        "sub": subject,
+        "client_id": "test-client",
+        "iat": issued_at,
+        "exp": 4_102_444_800,
+        "https://api.openai.com/auth": {
+            "chatgpt_account_id": account_id,
+        },
+    })
 
 
 class GCashClassificationTests(unittest.TestCase):
@@ -284,6 +324,19 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(result["status"], "no_at")
         self.assertEqual(factories, [])
 
+    def test_invalid_access_token_header_value_is_rejected_without_network(self):
+        factories = []
+
+        result = probe_gcash(
+            "token\r\nInjected: value",
+            session_factory=lambda **kwargs: factories.append(kwargs),
+        )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["decision"], "invalid_access_token")
+        self.assertEqual(result["status"], "token_invalid")
+        self.assertEqual(factories, [])
+
     def test_rejects_checkout_session_path_injection(self):
         session = FakeSession([
             FakeResponse({
@@ -301,6 +354,390 @@ class GCashNetworkProbeTests(unittest.TestCase):
         self.assertEqual(result["label"], "GCash unavailable")
         self.assertEqual(result["decision"], "checkout_session_invalid")
         self.assertEqual(len(session.calls), 1)
+
+    def test_auth_session_refresh_uses_fresh_token_and_cookies_for_checkout_only(self):
+        old_token = _account_token("account-stable")
+        fresh_token = _account_token("account-stable", issued_at=2)
+        checkout = {
+            "checkout_session_id": "cs_test_refreshed_auth",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({"accessToken": fresh_token}),
+            cookies={
+                "__Secure-next-auth.session-token": "fresh-session-cookie-secret",
+                "oai-did": "device-stable",
+                "__cf_bm": "bad\r\nInjected: value",
+                "unrelated_cookie": "must-not-be-forwarded",
+            },
+        )
+
+        result = probe_gcash(
+            old_token,
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header=(
+                "oai-did=device-stable; "
+                "__Secure-next-auth.session-token=old-session-cookie-secret; "
+                "__Host-next-auth.csrf-token=stored-csrf-secret; "
+                "oai-client-auth-info=stored-auth-info"
+            ),
+            proxy="http://ph-proxy.example:8080",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "refreshed")
+        auth_call = session.calls[0]
+        self.assertEqual(auth_call[0], "GET")
+        self.assertEqual(auth_call[1], "https://chatgpt.com/api/auth/session")
+        auth_headers = auth_call[2]["headers"]
+        for header in (
+            "Authorization",
+            "ChatGPT-Account-Id",
+            "Content-Type",
+            "x-openai-target-path",
+            "x-openai-target-route",
+        ):
+            self.assertNotIn(header, auth_headers)
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], f"Bearer {fresh_token}")
+        self.assertIn("__Secure-next-auth.session-token=fresh-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
+        self.assertIn("__Host-next-auth.csrf-token=stored-csrf-secret", checkout_headers["Cookie"])
+        self.assertIn("oai-client-auth-info=stored-auth-info", checkout_headers["Cookie"])
+        self.assertNotIn("unrelated_cookie", checkout_headers["Cookie"])
+        self.assertNotIn("Injected", checkout_headers["Cookie"])
+        self.assertNotIn(fresh_token, repr(result))
+        self.assertNotIn("fresh-session-cookie-secret", repr(result))
+        self.assertNotIn(old_token, repr(result))
+        self.assertNotIn("old-session-cookie-secret", repr(result))
+        self.assertEqual(session.cookies, {})
+
+    def test_refreshed_token_with_untrusted_issuer_is_not_adopted(self):
+        old_token = _account_token("account-stable")
+        untrusted_token = _account_token(
+            "account-stable",
+            issuer="https://attacker.invalid",
+        )
+        checkout = {
+            "checkout_session_id": "cs_test_untrusted_issuer",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({"accessToken": untrusted_token}),
+            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
+        )
+
+        result = probe_gcash(
+            old_token,
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "token_claim_mismatch")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
+        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertEqual(session.cookies, {})
+
+    def test_mismatched_auth_session_token_is_not_adopted(self):
+        old_token = _account_token("account-stable")
+        mismatched_token = _account_token("different-account")
+        checkout = {
+            "checkout_session_id": "cs_test_mismatched_refresh",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({"accessToken": mismatched_token}),
+            cookies={
+                "__Secure-next-auth.session-token": "fresh-session-cookie-secret",
+                "oai-did": "other-device",
+            },
+        )
+
+        result = probe_gcash(
+            old_token,
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
+            proxy="http://ph-proxy.example:8080",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "token_account_mismatch")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
+        self.assertIn("__Secure-next-auth.session-token=old-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
+        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertNotIn("oai-did=other-device", checkout_headers["Cookie"])
+        self.assertNotIn(mismatched_token, repr(result))
+        self.assertEqual(session.cookies, {})
+
+    def test_refresh_is_not_adopted_when_stored_token_is_bound_to_another_account(self):
+        old_token = _account_token("different-account")
+        fresh_token = _account_token("account-stable", issued_at=2)
+        checkout = {
+            "checkout_session_id": "cs_test_stored_token_mismatch",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({"accessToken": fresh_token}),
+            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
+        )
+
+        result = probe_gcash(
+            old_token,
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "token_unbound")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], f"Bearer {old_token}")
+        self.assertNotIn("fresh-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertEqual(session.cookies, {})
+
+    def test_invalid_refreshed_token_header_value_is_not_adopted(self):
+        invalid_token = _account_token("account-stable") + "\r\nInjected: value"
+        checkout = {
+            "checkout_session_id": "cs_test_invalid_refresh_token",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({"accessToken": invalid_token}),
+            cookies={"__Secure-next-auth.session-token": "fresh-session-cookie-secret"},
+        )
+
+        result = probe_gcash(
+            "existing-access-token-secret",
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=old-session-cookie-secret",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "token_invalid")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
+        self.assertNotIn("Injected", repr(checkout_headers))
+        self.assertEqual(session.cookies, {})
+
+    def test_auth_session_refresh_failure_falls_back_to_existing_credentials(self):
+        checkout = {
+            "checkout_session_id": "cs_test_refresh_failure",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_error=RuntimeError("simulated refresh failure with token-secret"),
+        )
+
+        result = probe_gcash(
+            "existing-access-token-secret",
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=existing-session-cookie-secret",
+            proxy="http://ph-proxy.example:8080",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "failed")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
+        self.assertIn("__Secure-next-auth.session-token=existing-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertNotIn("token-secret", repr(result))
+
+    def test_invalid_cookie_pair_is_removed_before_checkout(self):
+        checkout = {
+            "checkout_session_id": "cs_test_cookie_sanitization",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession([FakeResponse(checkout), FakeResponse(_gcash_payload())])
+
+        result = probe_gcash(
+            "existing-access-token-secret",
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header=(
+                "oai-did=device-stable; harmless=value; "
+                "bad=invalid\r\nInjected: header"
+            ),
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        checkout_headers = session.calls[0][2]["headers"]
+        self.assertIn("harmless=value", checkout_headers["Cookie"])
+        self.assertIn("oai-did=device-stable", checkout_headers["Cookie"])
+        self.assertNotIn("Injected", checkout_headers["Cookie"])
+
+    def test_invalid_identity_values_are_not_forwarded_as_headers(self):
+        checkout = {
+            "checkout_session_id": "cs_test_identity_sanitization",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession([FakeResponse(checkout), FakeResponse(_gcash_payload())])
+
+        result = probe_gcash(
+            "existing-access-token-secret",
+            account_id="account-stable\r\nInjected: account",
+            device_id="device-stable\r\nInjected: device",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        checkout_headers = session.calls[0][2]["headers"]
+        self.assertNotIn("ChatGPT-Account-Id", checkout_headers)
+        self.assertNotIn("Injected", checkout_headers["OAI-Device-Id"])
+
+    def test_auth_session_without_bound_token_does_not_adopt_refreshed_cookies(self):
+        checkout = {
+            "checkout_session_id": "cs_test_unbound_refresh",
+            "processor_entity": "openai_ie",
+            **_gcash_payload(),
+        }
+        session = FakeSession(
+            [FakeResponse(checkout), FakeResponse(_gcash_payload())],
+            auth_response=FakeResponse({}),
+            cookies={
+                "__Secure-next-auth.session-token": "unbound-session-cookie-secret",
+                "oai-did": "other-device",
+            },
+        )
+
+        result = probe_gcash(
+            "existing-access-token-secret",
+            account_id="account-stable",
+            device_id="device-stable",
+            cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=existing-session-cookie-secret",
+            proxy="http://ph-proxy.example:8080",
+            session_factory=lambda **_: session,
+        )
+
+        self.assertEqual(result["classification"], "eligible")
+        self.assertEqual(result["auth_refresh_status"], "no_token")
+        checkout_headers = session.calls[1][2]["headers"]
+        self.assertEqual(checkout_headers["Authorization"], "Bearer existing-access-token-secret")
+        self.assertIn("__Secure-next-auth.session-token=existing-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertNotIn("unbound-session-cookie-secret", checkout_headers["Cookie"])
+        self.assertNotIn("oai-did=other-device", checkout_headers["Cookie"])
+        self.assertEqual(session.cookies, {})
+
+    def test_checkout_http_400_diagnostics_are_opt_in_and_sanitized(self):
+        rich = FakeSession([
+            FakeResponse(
+                {
+                    "detail": "secret body value",
+                    "error": {"message": "token-secret"},
+                    "sensitive_token_field": "do-not-log-key-or-value",
+                },
+                status_code=400,
+                headers={"Content-Type": "application/json; charset=utf-8"},
+            ),
+        ])
+        minimal = FakeSession([
+            FakeResponse(
+                {"detail": "another secret", "error": {"message": "cookie-secret"}},
+                status_code=400,
+                headers={"Content-Type": "application/json"},
+            ),
+        ])
+        sessions = [rich, minimal]
+        factories = []
+
+        def factory(**kwargs):
+            factories.append(kwargs)
+            return sessions.pop(0)
+
+        with patch.dict(os.environ, {"GCASH_SAFE_DIAGNOSTICS": "1"}):
+            with self.assertLogs("gcash_probe", level="INFO") as captured:
+                result = probe_gcash(
+                    "access-token-secret",
+                    account_id="account-stable",
+                    device_id="device-stable",
+                    cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=session-cookie-secret",
+                    proxy="http://ph-proxy.example:8080",
+                    session_factory=factory,
+                )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["decision"], "checkout_http_400")
+        self.assertEqual(
+            [item["proxy"] for item in factories],
+            ["http://ph-proxy.example:8080", "http://ph-proxy.example:8080"],
+        )
+        self.assertEqual(
+            [item["impersonate"] for item in factories],
+            ["chrome146", "chrome146"],
+        )
+        log_text = "\n".join(captured.output)
+        self.assertIn("attempt=rich", log_text)
+        self.assertIn("attempt=minimal", log_text)
+        self.assertIn("media=json", log_text)
+        self.assertIn("keys=detail,error", log_text)
+        self.assertIn("other_keys=1", log_text)
+        self.assertIn("length_bucket=lt_1kb", log_text)
+        for secret in (
+            "secret body value",
+            "token-secret",
+            "cookie-secret",
+            "sensitive_token_field",
+            "do-not-log-key-or-value",
+            "access-token-secret",
+            "session-cookie-secret",
+            "ph-proxy.example",
+        ):
+            self.assertNotIn(secret, log_text)
+
+    def test_checkout_http_400_diagnostics_are_disabled_by_default(self):
+        rich = FakeSession([FakeResponse({"detail": "secret body value"}, status_code=400)])
+        minimal = FakeSession([FakeResponse({"detail": "another secret"}, status_code=400)])
+        sessions = [rich, minimal]
+
+        def factory(**kwargs):
+            return sessions.pop(0)
+
+        with patch.dict(os.environ, {}, clear=True):
+            with self.assertLogs("gcash_probe", level="INFO") as captured:
+                result = probe_gcash(
+                    "access-token-secret",
+                    account_id="account-stable",
+                    device_id="device-stable",
+                    cookie_header="oai-did=device-stable; __Secure-next-auth.session-token=session-cookie-secret",
+                    proxy="http://ph-proxy.example:8080",
+                    session_factory=factory,
+                )
+
+        self.assertEqual(result["classification"], "ineligible")
+        self.assertEqual(result["decision"], "checkout_http_400")
+        log_text = "\n".join(captured.output)
+        self.assertIn("checkout compatibility retry reason=checkout_http_400", log_text)
+        for marker in ("attempt=", "media=", "keys=", "length_bucket="):
+            self.assertNotIn(marker, log_text)
 
     def test_generic_checkout_http_400_retries_with_a_minimal_ph_contract(self):
         """A rejected optional promo payload must not hide a browser-visible method."""
