@@ -169,17 +169,21 @@ embed that admin token in frontend JavaScript.
 The probe follows the source project's GCash capability sequence, adapted
 clean-room and bounded to payment-capability stages:
 
-1. Create a Philippines/PHP Checkout for the ChatGPT Plus monthly plan with
+1. When a stored NextAuth session cookie is available, refresh
+   `/api/auth/session` through the same selected proxy and browser identity.
+   A returned access token is used only when its account claim matches the
+   selected account; refreshed cookies remain in memory for this probe only.
+2. Create a Philippines/PHP Checkout for the ChatGPT Plus monthly plan with
    the exact `plus-1-month-free` campaign and `check_card_proxy=true`. Use a
    Philippines proxy; a mismatched egress can be rejected as a billing-country
    mismatch.
-2. Update the same checkout session with the campaign, plan, interval, and
+3. Update the same checkout session with the campaign, plan, interval, and
    seat quantity.
-3. Synchronize taxes for the same session using the observed PH/PHP region and
+4. Synchronize taxes for the same session using the observed PH/PHP region and
    the account email. Tax synchronization is best-effort; a rejection does not
    erase method evidence.
-4. Resolve the same checkout session and collect payment-method evidence.
-5. Ask Stripe Payment Pages or Stripe Elements for capability metadata. A live
+5. Resolve the same checkout session and collect payment-method evidence.
+6. Ask Stripe Payment Pages or Stripe Elements for capability metadata. A live
    `cpmt_...` ID returned by Checkout is preferred; an ID may be supplied
    explicitly through `GCASH_CUSTOM_PAYMENT_METHOD_ID` when the upstream only
    returns an opaque custom-method slot. When Elements is queried, an opaque
@@ -220,6 +224,13 @@ because the requested contract has no third `unknown` state. Their stable
 available in the detail view/logs so an operator can distinguish “not present”
 from “could not read”. These diagnostics contain stage codes only, never raw
 Stripe responses or credentials.
+
+The detail view also exposes the sanitized `auth_refresh_status` code. Set
+`GCASH_SAFE_DIAGNOSTICS=1` to log only the refresh status and the rejected
+checkout response shape (attempt, media family, allowlisted JSON key names,
+unknown-key count, and length bucket). Raw response values, account identifiers,
+tokens, cookies, proxy credentials, email addresses, and checkout IDs are never
+logged or persisted.
 For a real PH GCash check, use a working Philippines proxy; a direct/US exit
 will normally return the US method set and therefore `GCash unavailable`.
 If a deployment needs to supply a known opaque custom-method ID for the
@@ -250,6 +261,11 @@ retry, update, taxes, and resolve. JSON checkout POSTs use a one-shot transport
 so cookies accumulated by a long-lived HTTP session cannot override the
 account cookie header. The selected proxy is still retained and direct fallback
 remains disabled.
+
+The optional auth-session refresh uses that same proxy and browser identity.
+It never sends an account-selection header or bearer token to the NextAuth
+session endpoint, never accepts a token for a different account, and never
+writes refreshed credentials back to the database.
 
 If the source-compatible checkout create payload receives a generic HTTP
 400/422, the probe makes one bounded compatibility attempt with a fresh HTTP

@@ -33,6 +33,7 @@ into this application.
 `gcash_probe.py` now implements the safe subset with this order:
 
 ```text
+GET  /api/auth/session                              (optional credential refresh)
 POST /backend-api/payments/checkout
 POST /backend-api/payments/checkout/update
 POST /backend-api/payments/checkout/taxes
@@ -40,6 +41,12 @@ GET  /backend-api/payments/checkout/{processor}/{checkout_session}
 POST /v1/payment_pages/{checkout_session}/init   (standard methods)
 GET  /v1/elements/sessions                      (custom method metadata)
 ```
+
+The optional session refresh runs through the same selected proxy before
+Checkout. A refreshed token is accepted only when its account claim matches the
+selected account, and refreshed cookies are kept in memory for the current
+probe. A failed or unbound refresh falls back to the stored credentials without
+changing the payment-method classification rules.
 
 The Checkout request is explicitly `PH`/`PHP`, carries the exact campaign ID,
 and sets `check_card_proxy=true`. Every later ChatGPT request is bound to the
