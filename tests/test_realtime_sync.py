@@ -190,6 +190,38 @@ class RealtimeRunEventTests(unittest.TestCase):
         self.assertNotIn("token-secret", repr(controller._run_event_history))
         persist.assert_not_called()
 
+    def test_automatic_plus_hook_crash_does_not_change_registration_success(self):
+        controller = AutoLoopController(self._database_path)
+        controller._state = AutoLoopState.RUNNING
+        controller._target_count = 1
+        controller._options = {"target_count": 1, "cool_down_seconds": 0}
+        provider = type("Provider", (), {"pooled": True})
+        account = {
+            "email": "survives@example.com",
+            "password": "mail-password",
+            "client_id": "client",
+            "refresh_token": "refresh",
+            "kind": "outlook",
+        }
+
+        with db.use_database_path(self._database_path), \
+                mock.patch("webui.auto_loop.get_provider_class", return_value=provider), \
+                mock.patch.object(db, "claim_next", return_value=account), \
+                mock.patch.object(registrar, "start_registration", return_value="run-safe"), \
+                mock.patch.object(controller, "_wait_run_finish", return_value=(True, "")), \
+                mock.patch.object(
+                    controller,
+                    "_check_plus_after_registration",
+                    side_effect=RuntimeError("sensitive post-check failure"),
+                    create=True,
+                ) as check_plus:
+            controller._worker_loop_scoped(0)
+
+        check_plus.assert_called_once()
+        self.assertEqual(controller._registered_ok, 1)
+        self.assertEqual(controller._registered_fail, 0)
+        self.assertNotIn("sensitive post-check failure", repr(controller._run_event_history))
+
 
 if __name__ == "__main__":
     unittest.main()

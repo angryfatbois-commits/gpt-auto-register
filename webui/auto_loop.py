@@ -20,7 +20,13 @@ from pathlib import Path
 from typing import Optional
 
 from . import db, registrar
+from eligibility import plus_probe_error
 from mail_providers import MailProviderError, get_provider_class
+from plus_probe import (
+    probe_plus_eligibility,
+    safe_plus_result_label,
+    should_persist_plus_result,
+)
 
 logger = logging.getLogger("auto_loop")
 
@@ -246,6 +252,87 @@ class AutoLoopController:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
 
+    def _registered_email_for_run(self, run_id: str, fallback_email: str) -> str:
+        """Resolve a generated provider's final address from its done event."""
+        with self._lock:
+            history = list(self._run_event_history)
+        for item in reversed(history):
+            if item.get("kind") != "run_event":
+                continue
+            packet = item.get("data")
+            if not isinstance(packet, dict) or packet.get("run_id") != run_id:
+                continue
+            if packet.get("event") != "status":
+                continue
+            data = packet.get("data")
+            if not isinstance(data, dict) or data.get("kind") != "done":
+                continue
+            email = str(data.get("email") or "").strip().lower()
+            if email:
+                return email
+        return str(fallback_email or "").strip().lower()
+
+    def _check_plus_after_registration(
+        self,
+        run_id: str,
+        *,
+        fallback_email: str,
+        proxy: str,
+    ) -> dict:
+        """Run a best-effort Plus check without changing registration success."""
+        email = self._registered_email_for_run(run_id, fallback_email)
+        self._publish_run_event(
+            run_id,
+            "status",
+            {"kind": "phase", "phase": "checking_plus_trial", "email": email},
+        )
+        try:
+            credential = db.get_registered(email)
+            if not credential:
+                result = plus_probe_error(
+                    "account_not_found",
+                    retryable=False,
+                    status="not_found",
+                    label="Not found",
+                )
+            else:
+                result = probe_plus_eligibility(
+                    credential.get("access_token", ""),
+                    email=email,
+                    device_id=credential.get("device_id", ""),
+                    proxy=proxy,
+                )
+            if should_persist_plus_result(result):
+                db.update_plus_check(email, result)
+        except Exception as error:
+            logger.warning(
+                "[plus-check] Automatic eligibility check failed safely (%s)",
+                type(error).__name__,
+            )
+            result = plus_probe_error(
+                "automatic_check_failed",
+                retryable=True,
+                status="error",
+                label="Check failed",
+            )
+
+        self._publish_run_event(
+            run_id,
+            "log",
+            {"line": f"[plus-check] {safe_plus_result_label(result)}"},
+        )
+        self._publish_run_event(
+            run_id,
+            "status",
+            {
+                "kind": "phase",
+                "phase": "plus_trial_checked",
+                "email": email,
+                "plus_status": str(result.get("status") or "error"),
+            },
+        )
+        return result
+
     def _record_finish(self, ok: bool, category: str):
         """Update counters and circuit-breaker state after a worker run."""
         with self._lock:
@@ -438,6 +525,22 @@ class AutoLoopController:
 
             # Wait for the current run.
             ok, category = self._wait_run_finish(run_id)
+
+            if ok:
+                try:
+                    self._check_plus_after_registration(
+                        run_id,
+                        fallback_email=account["email"],
+                        proxy=proxy,
+                    )
+                except Exception as error:
+                    # Eligibility is supplementary. Never turn a completed
+                    # registration into a failure if the post-check itself has
+                    # an unexpected implementation or storage error.
+                    logger.warning(
+                        "[plus-check] Post-registration hook failed safely (%s)",
+                        type(error).__name__,
+                    )
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)
