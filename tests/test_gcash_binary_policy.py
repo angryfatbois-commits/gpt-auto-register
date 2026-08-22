@@ -76,9 +76,13 @@ class GCashBinaryPolicyTests(unittest.TestCase):
         self.assertEqual(result["label"], "GCash unavailable")
         self.assertEqual(response["summary"], {"eligible": 0, "ineligible": 1})
         probe.assert_not_called()
-        persist.assert_called_once_with(
-            "person@example.com", "gcash_check", result
-        )
+        self.assertEqual(persist.call_count, 2)
+        self.assertEqual(persist.call_args_list[0].args[:2], (
+            "person@example.com", "plus_check",
+        ))
+        self.assertEqual(persist.call_args_list[1].args, (
+            "person@example.com", "gcash_check", result,
+        ))
 
 
 class GCashLegacyResultTests(unittest.TestCase):

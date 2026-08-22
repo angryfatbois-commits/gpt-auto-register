@@ -130,6 +130,66 @@ class PlusEligibilityApiTests(unittest.TestCase):
 
 
 class GCashEligibilityApiTests(unittest.TestCase):
+    def test_combined_probe_persists_and_returns_plus_and_gcash_results(self):
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "device-id",
+        }
+        plus_result = {
+            "operation": "plus_trial_eligibility",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "plus_1_month_free_available",
+            "status": "plus_eligible",
+            "label": "Plus trial eligible",
+            "discount_percentage": 100,
+            "duration_periods": 1,
+            "duration_unit": "month",
+        }
+        gcash_result = {
+            "operation": "gcash_payment_eligibility",
+            "check_scope": "payment_method_only",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "gcash_available",
+            "status": "eligible",
+            "label": "GCash available",
+            "amount_minor": 0,
+            "currency": "PHP",
+            "checkout_country": "PH",
+            "zero_payment": True,
+            "amount_status": "zero",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch(
+                 "webui.app.probe_checkout_eligibility",
+                 return_value={"plus": plus_result, "gcash": gcash_result},
+             ) as probe, \
+             patch("webui.app.db.update_eligibility_check") as persist:
+            response = api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        actual_gcash = response["results"]["person@example.com"]
+        for key, value in gcash_result.items():
+            self.assertEqual(actual_gcash[key], value)
+        self.assertEqual(response["plus_results"], {"person@example.com": plus_result})
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(persist.call_args_list[0], unittest.mock.call(
+            "person@example.com", "plus_check", plus_result,
+        ))
+        self.assertEqual(persist.call_args_list[1].args[:2], (
+            "person@example.com", "gcash_check",
+        ))
+        persisted_gcash = persist.call_args_list[1].args[2]
+        for key, value in gcash_result.items():
+            self.assertEqual(persisted_gcash[key], value)
+
     def test_fastapi_route_accepts_confirmed_loopback_request(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -207,7 +267,13 @@ class GCashEligibilityApiTests(unittest.TestCase):
         self.assertEqual(probe.call_args.kwargs["proxy"], "http://proxy.example:8080")
         self.assertEqual(probe.call_args.kwargs["access_token"], "access-token")
         self.assertEqual(probe.call_args.kwargs["checkout_email"], "person@example.com")
-        persist.assert_called_once_with("person@example.com", "gcash_check", probe_result)
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.args[:2], (
+            "person@example.com", "gcash_check",
+        ))
+        persisted = persist.call_args.args[2]
+        for key, value in probe_result.items():
+            self.assertEqual(persisted[key], value)
 
     def test_uses_oai_did_cookie_when_persisted_device_id_is_missing(self):
         cookie_device_id = "11111111-2222-4333-8444-555555555555"
@@ -283,9 +349,13 @@ class GCashEligibilityApiTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertEqual(result["label"], "GCash unavailable")
         probe.assert_not_called()
-        persist.assert_called_once_with(
-            "person@example.com", "gcash_check", result
-        )
+        self.assertEqual(persist.call_count, 2)
+        self.assertEqual(persist.call_args_list[0].args[:2], (
+            "person@example.com", "plus_check",
+        ))
+        self.assertEqual(persist.call_args_list[1], unittest.mock.call(
+            "person@example.com", "gcash_check", result,
+        ))
 
     def test_batch_size_is_bounded(self):
         with self.assertRaises(ValidationError):
