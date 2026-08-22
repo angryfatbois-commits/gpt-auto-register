@@ -62,11 +62,21 @@ class RealtimeRunEventTests(unittest.TestCase):
                 mock.patch("webui.auto_loop.get_provider_class", return_value=provider), \
                 mock.patch.object(db, "claim_next", return_value=account), \
                 mock.patch.object(registrar, "start_registration", return_value="run-two") as start, \
-                mock.patch.object(controller, "_wait_run_finish", return_value=(True, "")):
+                mock.patch.object(controller, "_wait_run_finish", return_value=(True, "")), \
+                mock.patch.object(
+                    controller,
+                    "_check_plus_after_registration",
+                    create=True,
+                ) as check_plus:
             controller._worker_loop_scoped(0)
 
         event_sink = start.call_args.kwargs.get("event_sink")
         self.assertTrue(callable(event_sink))
+        check_plus.assert_called_once_with(
+            "run-two",
+            fallback_email="two@example.com",
+            proxy="",
+        )
 
         subscriber = controller.subscribe()
         subscriber.get_nowait()  # Initial state snapshot.
@@ -101,6 +111,84 @@ class RealtimeRunEventTests(unittest.TestCase):
             subscriber.get_nowait()["data"]["data"]["line"],
             "early live line",
         )
+
+    def test_post_registration_plus_check_uses_final_email_and_persists_result(self):
+        controller = AutoLoopController(self._database_path)
+        run_id = "run-generated-address"
+        controller._publish_run_event(
+            run_id,
+            "status",
+            {
+                "kind": "done",
+                "email": "final@example.com",
+                "access_token_len": 100,
+            },
+        )
+        with db.use_database_path(self._database_path):
+            db.save_registered({
+                "email": "final@example.com",
+                "access_token": "stored-access-token",
+                "device_id": "stored-device",
+            })
+
+        eligible = {
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "plus_1_month_free_available",
+            "status": "plus_eligible",
+            "label": "Plus trial eligible",
+            "checked_at": 10.0,
+        }
+        with db.use_database_path(self._database_path), \
+                mock.patch(
+                    "webui.auto_loop.probe_plus_eligibility",
+                    return_value=eligible,
+                    create=True,
+                ) as probe, \
+                mock.patch.object(db, "update_plus_check") as persist:
+            result = controller._check_plus_after_registration(
+                run_id,
+                fallback_email="placeholder@placeholder.local",
+                proxy="http://ph-proxy.example:8080",
+            )
+
+        self.assertEqual(result, eligible)
+        probe.assert_called_once_with(
+            "stored-access-token",
+            email="final@example.com",
+            device_id="stored-device",
+            proxy="http://ph-proxy.example:8080",
+        )
+        persist.assert_called_once_with("final@example.com", eligible)
+
+    def test_post_registration_plus_failure_does_not_expose_or_raise(self):
+        controller = AutoLoopController(self._database_path)
+        run_id = "run-safe-failure"
+        with db.use_database_path(self._database_path):
+            db.save_registered({
+                "email": "safe@example.com",
+                "access_token": "stored-access-token",
+            })
+
+        with db.use_database_path(self._database_path), \
+                mock.patch(
+                    "webui.auto_loop.probe_plus_eligibility",
+                    side_effect=RuntimeError("token-secret from upstream"),
+                    create=True,
+                ), \
+                mock.patch.object(db, "update_plus_check") as persist:
+            result = controller._check_plus_after_registration(
+                run_id,
+                fallback_email="safe@example.com",
+                proxy="",
+            )
+
+        self.assertEqual(result["decision"], "automatic_check_failed")
+        self.assertEqual(result["status"], "error")
+        self.assertNotIn("token-secret", repr(result))
+        self.assertNotIn("token-secret", repr(controller._run_event_history))
+        persist.assert_not_called()
 
 
 if __name__ == "__main__":
