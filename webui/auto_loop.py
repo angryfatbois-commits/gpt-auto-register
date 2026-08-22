@@ -15,11 +15,18 @@ import logging
 import queue
 import threading
 import time
+from collections import deque
 from pathlib import Path
 from typing import Optional
 
 from . import db, registrar
+from eligibility import plus_probe_error
 from mail_providers import MailProviderError, get_provider_class
+from plus_probe import (
+    probe_plus_eligibility,
+    safe_plus_result_label,
+    should_persist_plus_result,
+)
 
 logger = logging.getLogger("auto_loop")
 
@@ -75,6 +82,9 @@ class AutoLoopController:
         self._last_break_reason = ""
         # SSE subscribers.
         self._subscribers: list[queue.Queue] = []
+        # Bounded replay lets a freshly loaded or reconnecting browser recover
+        # recent logs for workers that are still active.
+        self._run_event_history: deque[dict] = deque(maxlen=2000)
         # Proxy pool and concurrency.
         self._proxy_pool: list[str] = []
         self._concurrency: int = 1
@@ -96,6 +106,7 @@ class AutoLoopController:
             self._registered_ok = 0
             self._registered_fail = 0
             self._worker_status.clear()
+            self._run_event_history.clear()
             self._consecutive_network_fails = 0
             self._last_message = "Auto-loop started"
             # Parse concurrency settings.
@@ -152,19 +163,41 @@ class AutoLoopController:
         return self._snapshot()
 
     def subscribe(self) -> queue.Queue:
-        q: queue.Queue = queue.Queue(maxsize=100)
+        q: queue.Queue = queue.Queue(maxsize=2500)
         with self._lock:
             self._subscribers.append(q)
-        try:
-            q.put_nowait({"kind": "state", "data": self._snapshot()})
-        except queue.Full:
-            pass
+            active_run_ids = {
+                str(info.get("run_id") or "")
+                for info in self._worker_status.values()
+                if info.get("run_id")
+            }
+            replay = [
+                item for item in self._run_event_history
+                if str(item.get("data", {}).get("run_id") or "") in active_run_ids
+            ]
+            try:
+                q.put_nowait({"kind": "state", "data": self._snapshot()})
+                for item in replay:
+                    q.put_nowait(item)
+            except queue.Full:
+                pass
         return q
 
     def unsubscribe(self, q: queue.Queue):
         with self._lock:
             try: self._subscribers.remove(q)
             except ValueError: pass
+
+    def _publish_run_event(self, run_id: str, event: str, data: dict):
+        """Multiplex one worker's log/status event onto auto subscribers."""
+        packet = {
+            "run_id": run_id,
+            "event": event,
+            "data": data,
+        }
+        with self._lock:
+            self._run_event_history.append({"kind": "run_event", "data": packet})
+        self._broadcast("run_event", packet)
 
     # -------------------------------- Internals --------------------------------
 
@@ -218,6 +251,87 @@ class AutoLoopController:
         if self._proxy_pool:
             return self._proxy_pool[worker_id % len(self._proxy_pool)]
         return self._options.get("proxy", "") or ""
+
+    def _registered_email_for_run(self, run_id: str, fallback_email: str) -> str:
+        """Resolve a generated provider's final address from its done event."""
+        with self._lock:
+            history = list(self._run_event_history)
+        for item in reversed(history):
+            if item.get("kind") != "run_event":
+                continue
+            packet = item.get("data")
+            if not isinstance(packet, dict) or packet.get("run_id") != run_id:
+                continue
+            if packet.get("event") != "status":
+                continue
+            data = packet.get("data")
+            if not isinstance(data, dict) or data.get("kind") != "done":
+                continue
+            email = str(data.get("email") or "").strip().lower()
+            if email:
+                return email
+        return str(fallback_email or "").strip().lower()
+
+    def _check_plus_after_registration(
+        self,
+        run_id: str,
+        *,
+        fallback_email: str,
+        proxy: str,
+    ) -> dict:
+        """Run a best-effort Plus check without changing registration success."""
+        email = self._registered_email_for_run(run_id, fallback_email)
+        self._publish_run_event(
+            run_id,
+            "status",
+            {"kind": "phase", "phase": "checking_plus_trial", "email": email},
+        )
+        try:
+            credential = db.get_registered(email)
+            if not credential:
+                result = plus_probe_error(
+                    "account_not_found",
+                    retryable=False,
+                    status="not_found",
+                    label="Not found",
+                )
+            else:
+                result = probe_plus_eligibility(
+                    credential.get("access_token", ""),
+                    email=email,
+                    device_id=credential.get("device_id", ""),
+                    proxy=proxy,
+                )
+            if should_persist_plus_result(result):
+                db.update_plus_check(email, result)
+        except Exception as error:
+            logger.warning(
+                "[plus-check] Automatic eligibility check failed safely (%s)",
+                type(error).__name__,
+            )
+            result = plus_probe_error(
+                "automatic_check_failed",
+                retryable=True,
+                status="error",
+                label="Check failed",
+            )
+
+        self._publish_run_event(
+            run_id,
+            "log",
+            {"line": f"[plus-check] {safe_plus_result_label(result)}"},
+        )
+        self._publish_run_event(
+            run_id,
+            "status",
+            {
+                "kind": "phase",
+                "phase": "plus_trial_checked",
+                "email": email,
+                "plus_status": str(result.get("status") or "error"),
+            },
+        )
+        return result
 
     def _record_finish(self, ok: bool, category: str):
         """Update counters and circuit-breaker state after a worker run."""
@@ -382,7 +496,11 @@ class AutoLoopController:
 
             # Start one run.
             try:
-                run_id = registrar.start_registration(account, run_options)
+                run_id = registrar.start_registration(
+                    account,
+                    run_options,
+                    event_sink=self._publish_run_event,
+                )
             except Exception as e:
                 logger.exception(f"[worker-{worker_id}] Failed to start registration: {e}")
                 if pooled:
@@ -407,6 +525,22 @@ class AutoLoopController:
 
             # Wait for the current run.
             ok, category = self._wait_run_finish(run_id)
+
+            if ok:
+                try:
+                    self._check_plus_after_registration(
+                        run_id,
+                        fallback_email=account["email"],
+                        proxy=proxy,
+                    )
+                except Exception as error:
+                    # Eligibility is supplementary. Never turn a completed
+                    # registration into a failure if the post-check itself has
+                    # an unexpected implementation or storage error.
+                    logger.warning(
+                        "[plus-check] Post-registration hook failed safely (%s)",
+                        type(error).__name__,
+                    )
 
             with self._lock:
                 self._worker_status.pop(worker_id, None)

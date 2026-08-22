@@ -25,7 +25,7 @@ export function summarizeGCash(results) {
 export function gcashDisplayLabel(check) {
   if (!check) return ''
   return check.classification === 'eligible' || check.eligible === true ||
-    check.method_available === true || check.label === 'GCash eligible' ||
+    check.label === 'GCash eligible' ||
     check.label === 'GCash available'
     ? 'GCash available'
     : 'GCash unavailable'
@@ -37,6 +37,13 @@ function diagnosticCode(value) {
   return /^[A-Za-z][A-Za-z0-9_.-]{0,119}$/.test(text) ? text : ''
 }
 
+function authRefreshCode(value) {
+  const code = diagnosticCode(value)
+  return /^(?:not_requested|refreshed|no_token|token_(?:unbound|unparseable|invalid|claim_mismatch|account_mismatch)|failed|auth_session_(?:http_[1-5][0-9]{2}|invalid_(?:json|payload)))$/.test(code)
+    ? code
+    : ''
+}
+
 export function formatGCashDetail(check, formatTime = (value) => String(value)) {
   if (!check) return ''
   const parts = []
@@ -46,11 +53,18 @@ export function formatGCashDetail(check, formatTime = (value) => String(value)) 
   const probeStatus = diagnosticCode(check.custom_method_probe_status)
   const probeFailure = diagnosticCode(check.custom_method_probe_failure)
   const probeException = diagnosticCode(check.custom_method_probe_exception)
+  const authRefreshStatus = authRefreshCode(check.auth_refresh_status)
+  if (authRefreshStatus) parts.push(`Session: ${authRefreshStatus}`)
   if (probeStatus) parts.push(`Capability: ${probeStatus}`)
   if (probeFailure) parts.push(`Issue: ${probeFailure}`)
   if (probeException) parts.push(`Exception: ${probeException}`)
   if (check.checkout_country || check.currency) {
     parts.push(`Checkout: ${[check.checkout_country, check.currency].filter(Boolean).join(' / ')}`)
+  }
+  if (check.amount_status === 'zero' || check.amount_status === 'positive') {
+    const currency = String(check.currency || '').toUpperCase()
+    parts.push(`Due: ${currency || 'Minor units'} ${check.amount_minor}`)
+    parts.push(`Zero payment: ${check.zero_payment ? 'Yes' : 'No'}`)
   }
   if (check.checked_at) parts.push(`Checked: ${formatTime(check.checked_at)}`)
   return parts.join(' · ')

@@ -14,7 +14,7 @@ import time
 import traceback
 import uuid
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 ROOT = Path(__file__).resolve().parents[1]  # gpt-outlook-register/
 sys.path.insert(0, str(ROOT))
@@ -32,6 +32,7 @@ from . import db  # noqa: E402
 
 # Internal implementation note.
 _run_queues: dict[tuple[str, str], queue.Queue] = {}
+_run_event_sinks: dict[tuple[str, str], Callable[[str, str, dict], None]] = {}
 _lock = threading.Lock()
 
 # Internal implementation note.
@@ -97,6 +98,12 @@ class QueueLogHandler(logging.Handler):
             msg = self.format(record)
             self._fh.write(msg + "\n")
             self._fh.flush()
+            _publish_run_event(
+                self.run_id,
+                "log",
+                {"line": msg},
+                db_path=self.queue_key[0],
+            )
             q = _run_queues.get(self.queue_key)
             if q is not None:
                 q.put(msg)
@@ -114,12 +121,44 @@ class QueueLogHandler(logging.Handler):
 def _emit_status(run_id: str, kind: str, payload: dict | str = ""):
     """Internal implementation details."""
     import json as _json
-    q = _queue_for_run(run_id)
-    if q is None:
-        return
     body = payload if isinstance(payload, dict) else {"message": str(payload)}
     body["kind"] = kind
-    q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+    _publish_run_event(run_id, "status", body)
+    q = _queue_for_run(run_id)
+    if q is not None:
+        q.put("__EVENT__:" + _json.dumps(body, ensure_ascii=False))
+
+
+def _publish_run_event(
+    run_id: str,
+    event: str,
+    data: dict,
+    *,
+    db_path: str | Path | None = None,
+) -> None:
+    """Send a run event to an optional multiplexed subscriber.
+
+    Manual runs retain their private queue and SSE endpoint. Auto-loop runs
+    register a sink so every worker can share the single auto-loop connection.
+    """
+    key = _queue_key(run_id, db_path)
+    with _lock:
+        sink = _run_event_sinks.get(key)
+        if sink is None:
+            # Provider callbacks may execute on child threads that do not inherit
+            # the tenant ContextVar. Run IDs are random and globally unique.
+            sink = next((
+                candidate
+                for (__, candidate_run_id), candidate in _run_event_sinks.items()
+                if candidate_run_id == str(run_id)
+            ), None)
+    if sink is None:
+        return
+    try:
+        sink(str(run_id), str(event), dict(data or {}))
+    except Exception:
+        # UI delivery must never interrupt registration itself.
+        pass
 
 
 # Internal implementation note.
@@ -516,7 +555,10 @@ def _do_register(
             handler.close()
         except Exception:
             pass
-        q = _run_queues.get(_queue_key(run_id))
+        key = _queue_key(run_id)
+        with _lock:
+            q = _run_queues.get(key)
+            _run_event_sinks.pop(key, None)
         if q is not None:
             q.put(None)  # End-of-stream sentinel.
         # Internal implementation note.
@@ -656,7 +698,12 @@ def _do_register_in_database(
         _do_register(run_id, account, options, log_file)
 
 
-def start_registration(account: dict, options: dict) -> str:
+def start_registration(
+    account: dict,
+    options: dict,
+    *,
+    event_sink: Callable[[str, str, dict], None] | None = None,
+) -> str:
     """Internal implementation details."""
     run_id = uuid.uuid4().hex[:12]
     tenant_db_path = db.current_db_path()
@@ -666,9 +713,12 @@ def start_registration(account: dict, options: dict) -> str:
     log_file = tenant_log_dir / f"{run_id}.log"
     db.create_run(run_id, account["email"], str(log_file))
 
-    q: queue.Queue = queue.Queue()
     with _lock:
-        _run_queues[_queue_key(run_id, tenant_db_path)] = q
+        key = _queue_key(run_id, tenant_db_path)
+        if event_sink is None:
+            _run_queues[key] = queue.Queue()
+        else:
+            _run_event_sinks[key] = event_sink
 
     th = threading.Thread(
         target=_do_register_in_database,
@@ -686,4 +736,6 @@ def get_run_queue(run_id: str) -> Optional[queue.Queue]:
 
 def remove_run_queue(run_id: str) -> None:
     with _lock:
-        _run_queues.pop(_queue_key(run_id), None)
+        key = _queue_key(run_id)
+        _run_queues.pop(key, None)
+        _run_event_sinks.pop(key, None)

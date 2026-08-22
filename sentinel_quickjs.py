@@ -31,11 +31,13 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 logger = logging.getLogger(__name__)
 
@@ -53,24 +55,70 @@ def _quickjs_script_path() -> Path:
     return Path(__file__).resolve().parent / "openai_sentinel_quickjs.js"
 
 
-_sdk_file_cache: Optional[Path] = None
+_sdk_file_cache: dict[str, Path] = {}
 
 
-def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
+def _safe_header_value(value: Any, *, limit: int = 512) -> str:
+    """Keep browser-derived header values printable and bounded."""
+    text = str(value or "").strip()
+    if not text or len(text) > limit or any(ord(char) < 0x20 or ord(char) == 0x7F for char in text):
+        return ""
+    return text
+
+
+def _safe_sentinel_sdk_url(value: str) -> str:
+    url = str(value or SENTINEL_SDK_URL).strip()
+    parsed = urlparse(url)
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {"chatgpt.com", "sentinel.openai.com"}
+        or not re.fullmatch(r"/sentinel/[A-Za-z0-9_.-]{1,128}/sdk\.js", parsed.path)
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("Untrusted Sentinel SDK URL")
+    return url
+
+
+def _safe_sentinel_req_url(value: str, *, sdk_url: str) -> str:
+    requested = str(value or SENTINEL_REQ_URL).strip()
+    parsed = urlparse(requested)
+    sdk_host = urlparse(sdk_url).hostname
+    if (
+        parsed.scheme != "https"
+        or parsed.hostname not in {sdk_host, "chatgpt.com", "sentinel.openai.com"}
+        or parsed.path != "/backend-api/sentinel/req"
+        or parsed.query
+        or parsed.fragment
+    ):
+        raise RuntimeError("Untrusted Sentinel request URL")
+    return requested
+
+
+def _ensure_sdk_file(
+    session: Any,
+    timeout_ms: int,
+    *,
+    sdk_url: str = "",
+) -> tuple[Path, str]:
     """Download OpenAI's actual sdk.js to /tmp cache (one-shot per version)."""
-    global _sdk_file_cache
-    if _sdk_file_cache and _sdk_file_cache.exists():
-        return _sdk_file_cache
+    requested_url = _safe_sentinel_sdk_url(sdk_url)
+    cached = _sdk_file_cache.get(requested_url)
+    if cached and cached.exists():
+        return cached, requested_url
 
-    cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / SENTINEL_VERSION
+    version_match = re.search(r"/sentinel/([^/]+)/sdk\.js$", requested_url)
+    version = version_match.group(1) if version_match else SENTINEL_VERSION
+    safe_version = re.sub(r"[^A-Za-z0-9_.-]", "_", version)[:128] or SENTINEL_VERSION
+    cache_dir = Path(tempfile.gettempdir()) / "openai-sentinel-demo" / safe_version
     cache_dir.mkdir(parents=True, exist_ok=True)
     sdk_file = cache_dir / "sdk.js"
     if sdk_file.exists() and sdk_file.stat().st_size > 0:
-        _sdk_file_cache = sdk_file
-        return sdk_file
+        _sdk_file_cache[requested_url] = sdk_file
+        return sdk_file, requested_url
 
     resp = session.get(
-        SENTINEL_SDK_URL,
+        requested_url,
         headers={
             "accept": "*/*",
             "accept-language": "zh-CN,zh;q=0.9",
@@ -80,6 +128,7 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
             "sec-fetch-site": "same-site",
         },
         timeout=max(10, int(timeout_ms / 1000)),
+        allow_redirects=False,
     )
     if getattr(resp, "status_code", 0) != 200:
         raise RuntimeError(f"Failed to download sdk.js: HTTP {resp.status_code}")
@@ -87,8 +136,8 @@ def _ensure_sdk_file(session: Any, timeout_ms: int) -> Path:
     if not content:
         raise RuntimeError("Failed to download sdk.js: empty response")
     sdk_file.write_bytes(content)
-    _sdk_file_cache = sdk_file
-    return sdk_file
+    _sdk_file_cache[requested_url] = sdk_file
+    return sdk_file, requested_url
 
 
 def _run_quickjs_action(
@@ -130,23 +179,60 @@ def _fetch_sentinel_challenge(
     flow: str,
     request_p: str,
     timeout_ms: int,
+    request_url: str = "",
+    sdk_url: str = "",
+    user_agent: str = "",
+    isolated: bool | None = None,
+    sec_ch_ua: str = "",
+    sec_ch_ua_mobile: str = "",
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_full_version_list: str = "",
+    sec_ch_ua_arch: str = "",
+    sec_ch_ua_bitness: str = "",
+    sec_ch_ua_model: str = "",
+    sec_ch_ua_platform_version: str = "",
 ) -> dict:
+    resolved_sdk = _safe_sentinel_sdk_url(sdk_url)
+    resolved_request = _safe_sentinel_req_url(request_url, sdk_url=resolved_sdk)
+    parsed = urlparse(resolved_request)
+    origin = f"{parsed.scheme}://{parsed.netloc}"
+    version = re.search(r"/sentinel/([^/]+)/sdk\.js$", resolved_sdk).group(1)
     body = {"p": request_p, "id": device_id, "flow": flow}
-    resp = session.post(
-        SENTINEL_REQ_URL,
+    use_isolated = bool(request_url or sdk_url) if isolated is None else bool(isolated)
+    post = getattr(session, "post_isolated", None) if use_isolated else None
+    if not callable(post):
+        post = session.post
+    headers = {
+        "origin": origin,
+        "referer": f"{origin}/backend-api/sentinel/frame.html?sv={version}",
+        "content-type": "text/plain;charset=UTF-8",
+        "accept": "*/*",
+        "accept-encoding": "gzip, deflate, br, zstd",
+        "accept-language": "zh-CN,zh;q=0.9",
+        "sec-fetch-dest": "empty",
+        "sec-fetch-mode": "cors",
+        "sec-fetch-site": "same-origin",
+        "user-agent": _safe_header_value(user_agent) or "Mozilla/5.0",
+    }
+    for name, value in {
+        "sec-ch-ua": sec_ch_ua,
+        "sec-ch-ua-mobile": sec_ch_ua_mobile,
+        "sec-ch-ua-platform": sec_ch_ua_platform,
+        "sec-ch-ua-full-version-list": sec_ch_ua_full_version_list,
+        "sec-ch-ua-arch": sec_ch_ua_arch,
+        "sec-ch-ua-bitness": sec_ch_ua_bitness,
+        "sec-ch-ua-model": sec_ch_ua_model,
+        "sec-ch-ua-platform-version": sec_ch_ua_platform_version,
+    }.items():
+        safe_value = _safe_header_value(value)
+        if safe_value:
+            headers[name] = safe_value
+    resp = post(
+        resolved_request,
         data=json.dumps(body, separators=(",", ":")),
-        headers={
-            "origin": "https://sentinel.openai.com",
-            "referer": f"https://sentinel.openai.com/backend-api/sentinel/frame.html?sv={SENTINEL_VERSION}",
-            "content-type": "text/plain;charset=UTF-8",
-            "accept": "*/*",
-            "accept-encoding": "gzip, deflate, br, zstd",
-            "accept-language": "zh-CN,zh;q=0.9",
-            "sec-fetch-dest": "empty",
-            "sec-fetch-mode": "cors",
-            "sec-fetch-site": "same-origin",
-        },
+        headers=headers,
         timeout=max(10, int(timeout_ms / 1000)),
+        allow_redirects=False,
     )
     if getattr(resp, "status_code", 0) != 200:
         raise RuntimeError(f"/sentinel/req HTTP {resp.status_code}")
@@ -182,6 +268,11 @@ def get_sentinel_token_via_quickjs(
     sec_ch_ua_bitness: str = "",
     sec_ch_ua_model: str = "",
     sec_ch_ua_platform_version: str = "",
+    sec_ch_ua: str = "",
+    sec_ch_ua_platform: str = "",
+    sec_ch_ua_mobile: str = "",
+    sentinel_sdk_url: str = "",
+    sentinel_req_url: str = "",
 ) -> Optional[tuple[str, str]]:
     """Try the QuickJS path. Return JSON string on success, None on any failure.
 
@@ -253,8 +344,17 @@ def get_sentinel_token_via_quickjs(
     if device_memory is not None:
         env_payload["device_memory"] = int(device_memory)
 
+    explicit_transport = bool(
+        str(sentinel_sdk_url or "").strip() or str(sentinel_req_url or "").strip()
+    )
     try:
-        sdk_file = _ensure_sdk_file(session, timeout_ms)
+        sdk_file, resolved_sdk_url = _ensure_sdk_file(
+            session,
+            timeout_ms,
+            sdk_url=sentinel_sdk_url,
+        )
+        env_payload["sentinel_script_url"] = resolved_sdk_url
+        env_payload["sentinel_origin"] = "/".join(resolved_sdk_url.split("/")[:3])
 
         requirements = _run_quickjs_action(
             action="requirements",
@@ -269,7 +369,23 @@ def get_sentinel_token_via_quickjs(
             return None
 
         challenge = _fetch_sentinel_challenge(
-            session, device_id=did, flow=flow, request_p=request_p, timeout_ms=timeout_ms,
+            session,
+            device_id=did,
+            flow=flow,
+            request_p=request_p,
+            timeout_ms=timeout_ms,
+            request_url=sentinel_req_url,
+            sdk_url=resolved_sdk_url,
+            user_agent=user_agent,
+            isolated=explicit_transport,
+            sec_ch_ua=sec_ch_ua,
+            sec_ch_ua_mobile=sec_ch_ua_mobile,
+            sec_ch_ua_platform=sec_ch_ua_platform,
+            sec_ch_ua_full_version_list=sec_ch_ua_full_version_list,
+            sec_ch_ua_arch=sec_ch_ua_arch,
+            sec_ch_ua_bitness=sec_ch_ua_bitness,
+            sec_ch_ua_model=sec_ch_ua_model,
+            sec_ch_ua_platform_version=sec_ch_ua_platform_version,
         )
         c_value = str(challenge.get("token") or "").strip()
         if not c_value:

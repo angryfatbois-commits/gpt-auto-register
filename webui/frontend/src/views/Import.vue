@@ -68,7 +68,10 @@ async function doImport() {
     result.value = `Parsed ${r.parsed} lines: ${r.inserted} added, ${r.updated} updated, ${r.skipped} skipped`
     ElMessage.success('Import complete')
     text.value = ''
-    statsStore.refresh()
+    // The import response already contains the committed pool totals. Apply it
+    // synchronously instead of waiting for the next five-second poll.
+    if (r.stats) statsStore.applySnapshot(r.stats)
+    else await statsStore.refresh()
     runtime.bumpData()
   } catch (e) {
     // A 422 response includes per-line details; other errors contain one summary message.

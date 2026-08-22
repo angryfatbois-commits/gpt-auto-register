@@ -36,7 +36,7 @@ export const useRuntimeStore = defineStore('runtime', () => {
   const dataVersion = ref(0)      // Increment to refresh pool, result, and run tables.
   const runningSingle = ref(false)
 
-  let currentEs = null
+  let manualEs = null
   let autoEs = null
   let autoReconnectTimer = null
   let autoStreamWanted = false
@@ -49,11 +49,67 @@ export const useRuntimeStore = defineStore('runtime', () => {
   function bumpData() { dataVersion.value++ }
   function dismissBanner() { banner.value = '' }
 
-  // ─── SSE for a single registration run ───
-  function streamRun(runId) {
-    if (currentEs) { try { currentEs.close() } catch (_) {} }
+  function finalizeRunStream(es) {
+    if (!es || es.__finalized) return
+    es.__finalized = true
+    try { es.close() } catch (_) {}
+
+    if (manualEs === es) {
+      manualEs = null
+      runningSingle.value = false
+    }
+
+    // The database write happens before the run stream ends. Reconcile both
+    // statistics and cached tables even when EventSource ended through error.
+    useStatsStore().refresh()
+    bumpData()
+  }
+
+  function handleRunStatus(d, automatic = false) {
+    if (d.kind === 'done') {
+      if (!automatic) {
+        lastRunResult.value = {
+          email: d.email,
+          password: d.password || '',
+          access_token_len: d.access_token_len,
+          totp_secret: d.totp_secret || '',
+          partial: d.partial,
+        }
+      }
+      addLog(
+        `Registration complete: ${d.email}${d.password ? ' / ' + d.password : ''}`
+        + ` (access_token=${d.access_token_len}${d.partial ? ', partial credentials' : ''})`,
+        'ok',
+      )
+    } else if (d.kind === 'error') {
+      if (!automatic) lastRunResult.value = { email: d.email, error: d.message }
+      addLog('Error: ' + d.message, 'err')
+    } else if (d.kind === 'phase') {
+      addLog(`phase=${d.phase} email=${d.email}`, 'evt')
+    }
+    if (automatic && (d.kind === 'done' || d.kind === 'error')) {
+      useStatsStore().refresh()
+      bumpData()
+    }
+  }
+
+  function openRunStream(runId) {
+    const id = String(runId || '').trim()
+    if (!id) return null
+
+    if (manualEs) {
+      manualEs.__finalized = true
+      try { manualEs.close() } catch (_) {}
+      manualEs = null
+    }
     runningSingle.value = true
-    const es = createSSE(`/api/runs/${runId}/stream`, {
+    // A manual registration claims the mailbox before returning its run ID.
+    // Refresh now so the header immediately moves it to In progress.
+    useStatsStore().refresh()
+    bumpData()
+
+    let es = null
+    es = createSSE(`/api/runs/${id}/stream`, {
       log: (e) => {
         try {
           const d = JSON.parse(e.data)
@@ -62,40 +118,23 @@ export const useRuntimeStore = defineStore('runtime', () => {
       },
       status: (e) => {
         try {
-          const d = JSON.parse(e.data)
-          if (d.kind === 'done') {
-            lastRunResult.value = {
-              email: d.email,
-              password: d.password || '',
-              access_token_len: d.access_token_len,
-              partial: d.partial,
-            }
-            addLog(
-              `Registration complete: ${d.email}${d.password ? ' / ' + d.password : ''}`
-              + ` (access_token=${d.access_token_len}${d.partial ? ', partial credentials' : ''})`,
-              'ok',
-            )
-          } else if (d.kind === 'error') {
-            lastRunResult.value = { email: d.email, error: d.message }
-            addLog('Error: ' + d.message, 'err')
-          } else if (d.kind === 'phase') {
-            addLog(`phase=${d.phase} email=${d.email}`, 'evt')
-          }
+          handleRunStatus(JSON.parse(e.data))
         } catch (_) {}
       },
       end: () => {
-        try { es.close() } catch (_) {}
-        currentEs = null
-        runningSingle.value = false
-        useStatsStore().refresh()
-        bumpData()
+        finalizeRunStream(es)
       },
     }, () => {
-      try { es.close() } catch (_) {}
-      currentEs = null
-      runningSingle.value = false
+      finalizeRunStream(es)
     })
-    currentEs = es
+
+    manualEs = es
+    return es
+  }
+
+  // ─── SSE for a registration run started manually ───
+  function streamRun(runId) {
+    return openRunStream(runId)
   }
 
   // ─── Global automatic-run SSE, connected at startup with automatic reconnect ───
@@ -108,13 +147,27 @@ export const useRuntimeStore = defineStore('runtime', () => {
     if (autoEs) { try { autoEs.close() } catch (_) {} }
     const es = createSSE('/api/auto/stream', {
       state: (e) => {
-        try { autoStatus.value = JSON.parse(e.data) } catch (_) {}
+        try {
+          const next = JSON.parse(e.data)
+          autoStatus.value = next
+
+          const statsStore = useStatsStore()
+          if (next.pool_stats && statsStore.applySnapshot(next.pool_stats)) bumpData()
+
+        } catch (_) {}
       },
       run_started: (e) => {
         try {
           const d = JSON.parse(e.data)
           addLog(`[auto] Registration started for ${d.email} (run=${d.run_id})`, 'evt')
-          streamRun(d.run_id) // Reuse the single-run SSE to stream this run's logs.
+        } catch (_) {}
+      },
+      run_event: (e) => {
+        try {
+          const d = JSON.parse(e.data)
+          const payload = d.data || {}
+          if (d.event === 'log' && payload.line) addLog(payload.line)
+          else if (d.event === 'status') handleRunStatus(payload, true)
         } catch (_) {}
       },
       run_finished: (e) => {
@@ -155,9 +208,10 @@ export const useRuntimeStore = defineStore('runtime', () => {
       clearTimeout(autoReconnectTimer)
       autoReconnectTimer = null
     }
-    if (currentEs) {
-      try { currentEs.close() } catch (_) {}
-      currentEs = null
+    if (manualEs) {
+      manualEs.__finalized = true
+      try { manualEs.close() } catch (_) {}
+      manualEs = null
     }
     if (autoEs) {
       try { autoEs.close() } catch (_) {}

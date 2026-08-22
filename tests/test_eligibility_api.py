@@ -2,6 +2,7 @@ import unittest
 import warnings
 import gc
 import tempfile
+import uuid
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -89,8 +90,106 @@ class PlusEligibilityApiTests(unittest.TestCase):
                 emails=[f"person-{index}@example.com" for index in range(51)]
             )
 
+    def test_one_plus_probe_failure_does_not_abort_remaining_accounts(self):
+        credentials = {
+            "one@example.com": {"access_token": "one-token"},
+            "two@example.com": {"access_token": "two-token"},
+        }
+        eligible = {
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "plus_1_month_free_available",
+            "status": "plus_eligible",
+            "label": "Plus trial eligible",
+            "checked_at": 10.0,
+        }
+
+        def probe(access_token, **_):
+            if access_token == "one-token":
+                raise RuntimeError("private token-secret from upstream")
+            return eligible
+
+        with patch(
+            "webui.app.db.get_registered",
+            side_effect=lambda email: credentials[email],
+        ), patch("webui.app.probe_plus_eligibility", side_effect=probe), \
+                patch("webui.app.db.update_plus_check") as persist:
+            response = api_check_plus(CheckPlusReq(
+                emails=["one@example.com", "two@example.com"]
+            ))
+
+        first = response["results"]["one@example.com"]
+        self.assertEqual(first["decision"], "probe_unexpected_error")
+        self.assertNotIn("token-secret", repr(first))
+        self.assertEqual(
+            response["results"]["two@example.com"]["classification"],
+            "eligible",
+        )
+        persist.assert_called_once_with("two@example.com", eligible)
+
 
 class GCashEligibilityApiTests(unittest.TestCase):
+    def test_combined_probe_persists_and_returns_plus_and_gcash_results(self):
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "device-id",
+        }
+        plus_result = {
+            "operation": "plus_trial_eligibility",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "plus_1_month_free_available",
+            "status": "plus_eligible",
+            "label": "Plus trial eligible",
+            "discount_percentage": 100,
+            "duration_periods": 1,
+            "duration_unit": "month",
+        }
+        gcash_result = {
+            "operation": "gcash_payment_eligibility",
+            "check_scope": "payment_method_only",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "gcash_available",
+            "status": "eligible",
+            "label": "GCash available",
+            "amount_minor": 0,
+            "currency": "PHP",
+            "checkout_country": "PH",
+            "zero_payment": True,
+            "amount_status": "zero",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch(
+                 "webui.app.probe_checkout_eligibility",
+                 return_value={"plus": plus_result, "gcash": gcash_result},
+             ) as probe, \
+             patch("webui.app.db.update_eligibility_check") as persist:
+            response = api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        actual_gcash = response["results"]["person@example.com"]
+        for key, value in gcash_result.items():
+            self.assertEqual(actual_gcash[key], value)
+        self.assertEqual(response["plus_results"], {"person@example.com": plus_result})
+        self.assertEqual(probe.call_count, 1)
+        self.assertEqual(persist.call_args_list[0], unittest.mock.call(
+            "person@example.com", "plus_check", plus_result,
+        ))
+        self.assertEqual(persist.call_args_list[1].args[:2], (
+            "person@example.com", "gcash_check",
+        ))
+        persisted_gcash = persist.call_args_list[1].args[2]
+        for key, value in gcash_result.items():
+            self.assertEqual(persisted_gcash[key], value)
+
     def test_fastapi_route_accepts_confirmed_loopback_request(self):
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
@@ -132,6 +231,19 @@ class GCashEligibilityApiTests(unittest.TestCase):
         result = response.json()["results"]["person@example.com"]
         self.assertEqual(result["decision"], "account_not_found")
 
+    def test_account_not_found_returns_both_verdicts_without_writing_a_missing_row(self):
+        with patch("webui.app.db.get_registered", return_value=None), \
+             patch("webui.app.db.update_eligibility_check") as persist:
+            response = api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        email = "person@example.com"
+        self.assertEqual(response["plus_results"][email]["decision"], "account_not_found")
+        self.assertEqual(response["results"][email]["decision"], "account_not_found")
+        persist.assert_not_called()
+
     def test_deduplicates_emails_and_returns_structured_results(self):
         credential = {
             "email": "person@example.com",
@@ -168,7 +280,73 @@ class GCashEligibilityApiTests(unittest.TestCase):
         self.assertEqual(probe.call_args.kwargs["proxy"], "http://proxy.example:8080")
         self.assertEqual(probe.call_args.kwargs["access_token"], "access-token")
         self.assertEqual(probe.call_args.kwargs["checkout_email"], "person@example.com")
-        persist.assert_called_once_with("person@example.com", "gcash_check", probe_result)
+        persist.assert_called_once()
+        self.assertEqual(persist.call_args.args[:2], (
+            "person@example.com", "gcash_check",
+        ))
+        persisted = persist.call_args.args[2]
+        for key, value in probe_result.items():
+            self.assertEqual(persisted[key], value)
+
+    def test_uses_oai_did_cookie_when_persisted_device_id_is_missing(self):
+        cookie_device_id = "11111111-2222-4333-8444-555555555555"
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "",
+            "cookie_header": (
+                "__Secure-next-auth.session-token=session-secret; "
+                f"oai-did={cookie_device_id}; oai-sc=scope-cookie"
+            ),
+        }
+        probe_result = {
+            "operation": "gcash_payment_eligibility",
+            "check_scope": "payment_method_only",
+            "classification": "eligible",
+            "eligible": True,
+            "conclusive": True,
+            "decision": "gcash_available",
+            "status": "eligible",
+            "label": "GCash available",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch("webui.app.probe_gcash", return_value=probe_result) as probe, \
+             patch("webui.app.db.update_eligibility_check"):
+            api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        self.assertEqual(probe.call_args.kwargs["device_id"], cookie_device_id)
+
+    def test_rejects_an_invalid_oai_did_cookie_before_building_headers(self):
+        credential = {
+            "email": "person@example.com",
+            "access_token": "access-token",
+            "device_id": "",
+            "cookie_header": "oai-did=invalid-device\r\nInjected: value",
+        }
+        probe_result = {
+            "classification": "ineligible",
+            "eligible": False,
+            "conclusive": True,
+            "decision": "gcash_unavailable",
+            "status": "ineligible",
+            "label": "GCash unavailable",
+        }
+
+        with patch("webui.app.db.get_registered", return_value=credential), \
+             patch("webui.app.probe_gcash", return_value=probe_result) as probe, \
+             patch("webui.app.db.update_eligibility_check"):
+            api_check_gcash(
+                CheckGCashReq(emails=["person@example.com"]),
+                _gcash_request(),
+            )
+
+        device_id = probe.call_args.kwargs["device_id"]
+        self.assertEqual(str(uuid.UUID(device_id)), device_id)
+        self.assertNotIn("Injected", device_id)
 
     def test_missing_access_token_is_unavailable_without_calling_probe(self):
         with patch("webui.app.db.get_registered", return_value={"email": "person@example.com"}), \
@@ -184,9 +362,13 @@ class GCashEligibilityApiTests(unittest.TestCase):
         self.assertFalse(result["eligible"])
         self.assertEqual(result["label"], "GCash unavailable")
         probe.assert_not_called()
-        persist.assert_called_once_with(
-            "person@example.com", "gcash_check", result
-        )
+        self.assertEqual(persist.call_count, 2)
+        self.assertEqual(persist.call_args_list[0].args[:2], (
+            "person@example.com", "plus_check",
+        ))
+        self.assertEqual(persist.call_args_list[1], unittest.mock.call(
+            "person@example.com", "gcash_check", result,
+        ))
 
     def test_batch_size_is_bounded(self):
         with self.assertRaises(ValidationError):

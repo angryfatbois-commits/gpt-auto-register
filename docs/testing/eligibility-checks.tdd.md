@@ -1,5 +1,10 @@
 # Eligibility Checks: TDD Evidence
 
+> **Superseded workflow note (2026-08-22):** The historical protocol table in
+> this document describes the former update/tax/resolve implementation. The
+> current contract is documented and tested in
+> [`har-checkout-workflow.tdd.md`](har-checkout-workflow.tdd.md).
+
 ## Source
 
 The user journeys and acceptance criteria were derived during the gated

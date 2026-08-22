@@ -1,5 +1,5 @@
 <script setup>
-import { computed, onMounted, onUnmounted, ref } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { storeToRefs } from 'pinia'
 import { useThemeStore } from '@/stores/theme'
@@ -17,6 +17,7 @@ const { stats } = storeToRefs(statsStore)
 const { banner } = storeToRefs(runtime)
 
 const collapse = ref(false)
+let backgroundTenantId = ''
 
 const GROUP_ORDER = ['Overview', 'Registration', 'Data', 'Settings', 'Administration']
 const groups = computed(() => {
@@ -52,19 +53,37 @@ const statPills = computed(() => [
   { label: 'Failed', value: stats.value.failed, type: 'danger' },
 ])
 
-onMounted(() => {
-  theme.apply()
-  if (!auth.user) return
+function startBackground(userId) {
+  if (!userId || backgroundTenantId === userId) return
+  backgroundTenantId = userId
   statsStore.startPolling()
   runtime.connectAutoStream()
+}
+
+function stopBackground() {
+  backgroundTenantId = ''
+  statsStore.stopPolling()
+  runtime.disconnectStreams()
+}
+
+onMounted(() => {
+  theme.apply()
+  startBackground(auth.user?.id)
+})
+
+// The protected shell can mount while auth.load() is still resolving. Start
+// tenant polling/SSE when the user becomes available instead of returning
+// permanently from the initial mounted callback.
+watch(() => auth.user?.id, (userId, previousId) => {
+  if (userId) startBackground(userId)
+  else if (previousId) stopBackground()
 })
 
 onUnmounted(() => {
   // The layout owns the authenticated tenant's background work. Stop it as
   // soon as the session leaves the protected shell so a public route never
   // keeps polling or reconnecting with the previous tenant's credentials.
-  statsStore.stopPolling()
-  runtime.disconnectStreams()
+  stopBackground()
 })
 
 async function signOut() {

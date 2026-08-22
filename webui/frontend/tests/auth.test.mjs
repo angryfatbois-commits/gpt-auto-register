@@ -28,6 +28,16 @@ test('protected layout disconnects tenant background work when it unmounts', asy
   assert.match(runtime, /clearTimeout\(autoReconnectTimer\)/)
 })
 
+test('protected layout starts realtime work when authentication finishes after mount', async () => {
+  const layout = await readFile(new URL('../src/layouts/AdminLayout.vue', import.meta.url), 'utf8')
+
+  assert.match(layout, /watch\(\(\)\s*=>\s*auth\.user\?\.id/)
+  assert.match(layout, /if \(userId\).*startBackground|userId\s*\?\s*startBackground/s)
+  assert.match(layout, /statsStore\.startPolling\(\)/)
+  assert.match(layout, /runtime\.connectAutoStream\(\)/)
+  assert.doesNotMatch(layout, /onMounted\(\(\)\s*=>\s*{[^}]*if \(!auth\.user\) return/s)
+})
+
 test('legacy browser state can be claimed by only one administrator', async () => {
   const { readTenantStorage, tenantStorageKey } = await import('../src/stores/tenant-storage.js')
   const values = new Map([['legacy-settings', '{"proxy":"old"}']])

@@ -33,16 +33,23 @@ sys.path.insert(0, str(ROOT))
 from . import auth, db, export_formats, registrar  # noqa: E402
 from .auto_loop import get_controller  # noqa: E402
 from .exporter import _decode_jwt_payload, _get_auth  # noqa: E402
-from eligibility import (  # noqa: E402
-    parse_plus_eligibility,
-    plus_probe_error,
-    redact_sensitive_text,
-)
+from eligibility import plus_probe_error  # noqa: E402
 from gcash_probe import (  # noqa: E402
     gcash_probe_error,
     normalize_gcash_result,
-    probe_gcash,
+    probe_checkout_eligibility,
 )
+from plus_probe import (  # noqa: E402
+    plus_operator_note,
+    probe_plus_eligibility,
+    should_persist_plus_result,
+)
+
+# Keep the short module-level name used by existing integrations and tests,
+# while resolving the combined workflow at call time so dependency injection
+# can patch either public name safely.
+def probe_gcash(*args, **kwargs):
+    return probe_checkout_eligibility(*args, **kwargs)
 from mail_providers import (  # noqa: E402
     ImportValidationError,
     MailProviderError,
@@ -1209,39 +1216,26 @@ def _require_local_confirmed_gcash_request(request: Request) -> None:
         )
 
 
-# OpenAI uses several phrases for deactivation in 401/403 response bodies.
-# Match lowercase substrings here and log unmatched body metadata for extension.
-_DEACTIVATED_MARKERS = (
-    "account_deactivated",
-    "accountdeactivated",
-    "deactivated",
-    "has been deactivated",
-    "disabled",
-    "suspended",
-    "banned",
-    "violat",          # violating / violation of our policies
-    "potential abuse",
-    "terminated",
-)
+def _gcash_device_id(credential: dict, email: str) -> str:
+    """Keep the checkout device header consistent with the stored cookie jar."""
+    cookie_header = str(credential.get("cookie_header") or "")
+    for part in cookie_header.split(";"):
+        name, separator, value = part.strip().partition("=")
+        if separator and name.strip().lower() == "oai-did":
+            try:
+                return str(uuid.UUID(value.strip()))
+            except (AttributeError, ValueError):
+                break
 
-
-def _body_text(resp) -> str:
-    """Read response text without allowing errors to stop the probe loop."""
-    try:
-        return (resp.text or "").strip()
-    except Exception:  # noqa: BLE001
-        return ""
-
-
-def _looks_deactivated(body: str) -> bool:
-    return any(m in body.lower() for m in _DEACTIVATED_MARKERS)
+    persisted = str(credential.get("device_id") or "").strip()
+    if persisted:
+        return persisted
+    return str(uuid.uuid5(uuid.NAMESPACE_DNS, f"gpt-auto-register-gcash:{email}"))
 
 
 @app.post("/api/registered/check_plus")
 def api_check_plus(req: CheckPlusReq):
     """Check Plus trial eligibility using each account's access token."""
-    from http_client import create_http_session
-
     emails = list(dict.fromkeys(
         str(email or "").strip().lower() for email in req.emails
         if str(email or "").strip()
@@ -1251,66 +1245,11 @@ def api_check_plus(req: CheckPlusReq):
     if len(emails) > 50:
         raise HTTPException(400, "A maximum of 50 accounts can be checked at once")
 
-    log = logging.getLogger("webui")
-    url = "https://chatgpt.com/backend-api/accounts/check/v4-2023-04-27?timezone_offset_min=-"
-    ua = (
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-        "AppleWebKit/537.36 (KHTML, like Gecko) "
-        "Chrome/145.0.0.0 Safari/537.36"
-    )
-
-    # Reuse the registration HTTP client. It converts socks5:// to socks5h:// so
-    # DNS resolves through the proxy, and uses trust_env=False so an explicitly
-    # blank proxy is a true direct connection rather than an environment override.
     proxy = req.proxy.strip()
     if len(proxy) > 2048:
         raise HTTPException(400, "Proxy URL is too long")
-    try:
-        sess = create_http_session(proxy=proxy or None, impersonate="chrome110")
-    except Exception as e:  # noqa: BLE001
-        raise HTTPException(500, f"Failed to create HTTP session: {type(e).__name__}")
-
-    note = ""
-
-    def _check(access_token: str, account_id: str = "", device_id: str = ""):
-        """Send one eligibility request.
-
-        Never fall back silently to a direct connection after a proxy error. A
-        stale or rejected proxy must not expose the user's real IP. Retry once
-        through the same route instead.
-
-        Include browser-equivalent Origin, Referer, account, and device headers.
-        Decode account_id from the access-token JWT without another request.
-        """
-        nonlocal note
-        headers = {
-            "Authorization": f"Bearer {access_token}",
-            "Accept": "application/json",
-            "User-Agent": ua,
-            "Origin": "https://chatgpt.com",
-            "Referer": "https://chatgpt.com/",
-        }
-        if account_id:
-            headers["ChatGPT-Account-ID"] = account_id
-        if device_id:
-            headers["OAI-Device-Id"] = device_id
-        try:
-            return sess.get(url, headers=headers, timeout=15, allow_redirects=False)
-        except Exception as e:  # noqa: BLE001
-            if proxy and not note:
-                # Preserve curl codes: 97 means SOCKS5 authentication rejection;
-                # 7 means unreachable. They distinguish credentials from outages.
-                msg = str(e)
-                if "(97)" in msg or "rejected by the SOCKS5" in msg:
-                    note = "Proxy authentication was rejected (SOCKS5 error 97)"
-                elif "(7)" in msg:
-                    note = "The proxy is unreachable (curl error 7)"
-                else:
-                    note = f"The proxy request failed ({type(e).__name__}); direct fallback was not used"
-                log.warning("[check_plus] %s: %s", note, redact_sensitive_text(msg, limit=140))
-            raise
-
     results = {}
+    notes = []
     for email in emails:
         cred = db.get_registered(email)
         if not cred:
@@ -1318,97 +1257,39 @@ def api_check_plus(req: CheckPlusReq):
                 "account_not_found", retryable=False, status="not_found", label="Not found"
             )
             continue
-        at = (cred.get("access_token") or "").strip()
-        if not at:
-            results[email] = plus_probe_error(
-                "missing_access_token", retryable=False, status="no_at", label="No access token"
-            )
-            continue
-        # Decode account_id from the access-token JWT without another request.
-        auth_claims = _get_auth(_decode_jwt_payload(at))
-        account_id = str(
-            auth_claims.get("chatgpt_account_id") or auth_claims.get("account_id") or ""
-        ).strip()
-        # Derive a stable UUID when device_id was not persisted so repeat checks
-        # resemble a consistent client rather than a new random device each time.
-        device_id = (cred.get("device_id") or "").strip() or str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, f"dango-check-plus:{email}")
-        )
         try:
-            resp = _check(at, account_id, device_id)
-        except Exception as e:  # noqa: BLE001
-            results[email] = plus_probe_error(
-                "network_error", retryable=True, status="error", label="Network error"
+            info = probe_plus_eligibility(
+                cred.get("access_token", ""),
+                email=email,
+                device_id=cred.get("device_id", ""),
+                proxy=proxy,
             )
-            log.warning(
-                "[check_plus] request failed for %s: %s",
-                email,
-                redact_sensitive_text(e, limit=140),
+        except Exception as error:  # Defensive: one account must not abort the batch.
+            logger.warning(
+                "[check_plus] Unexpected probe failure handled safely (%s)",
+                type(error).__name__,
             )
-            continue
-        if resp.status_code in (401, 403):
-            # Inspect 401/403 bodies: a deactivated account can revoke an otherwise
-            # unexpired token, so status alone cannot distinguish deactivation from
-            # ordinary credential expiration or rotation.
-            body = _body_text(resp)
-            if _looks_deactivated(body):
-                results[email] = plus_probe_error(
-                    "account_deactivated", retryable=False,
-                    status="banned", label="Account deactivated",
-                )
-                results[email].update({"classification": "ineligible", "eligible": False, "conclusive": True})
-                log.info("[check_plus] account deactivated for %s (HTTP %s)", email, resp.status_code)
-                continue
-            if resp.status_code == 401:
-                results[email] = plus_probe_error(
-                    "token_invalid", retryable=False,
-                    status="token_invalid", label="Access token invalid",
-                )
-                # Log only metadata; response bodies may contain sensitive data.
-                log.info("[check_plus] unauthorized response for %s (body length=%s)", email, len(body))
-                continue
-            results[email] = plus_probe_error(
-                f"http_{resp.status_code}", retryable=False,
-                status="error", label=f"HTTP {resp.status_code}",
+            info = plus_probe_error(
+                "probe_unexpected_error",
+                retryable=True,
+                status="error",
+                label="Check failed",
             )
-            log.info("[check_plus] forbidden response for %s (body length=%s)", email, len(body))
-            continue
-        if resp.status_code != 200:
-            results[email] = plus_probe_error(
-                f"http_{resp.status_code}", retryable=resp.status_code >= 500,
-                status="error", label=f"HTTP {resp.status_code}",
-            )
-            continue
-        try:
-            data = resp.json()
-        except Exception:  # noqa: BLE001
-            results[email] = plus_probe_error(
-                "invalid_json", retryable=True, status="error", label="Invalid response"
-            )
-            continue
-        results[email] = parse_plus_eligibility(data, account_id=account_id)
+        results[email] = info
+        note = plus_operator_note(info)
+        if note and note not in notes:
+            notes.append(note)
 
-    try:
-        sess.close()
-    except Exception:  # noqa: BLE001
-        pass
-
-    checked_at = time.time()
     for email, info in results.items():
-        # Do not persist not_found/no_at/error: they indicate that no conclusion was
-        # reached. Persisting them would hide the account from the unchecked filter.
-        #
-        # Persist token_invalid so an old plus_eligible result is not left visible
-        # after token revocation. It is a meaningful terminal observation here.
-        if info["status"] not in ("not_found", "no_at", "error"):
-            db.update_plus_check(email, {**info, "checked_at": checked_at})
+        if should_persist_plus_result(info):
+            db.update_plus_check(email, info)
 
-    return {"ok": True, "results": results, "note": note}
+    return {"ok": True, "results": results, "note": "; ".join(notes)}
 
 
 @app.post("/api/registered/check_gcash")
 def api_check_gcash(req: CheckGCashReq, request: Request):
-    """Check whether GCash is exposed, without confirming or starting payment."""
+    """Run the read-only Plus + GCash workflow without executing payment."""
     _require_local_confirmed_gcash_request(request)
     emails = list(dict.fromkeys(
         str(email or "").strip().lower() for email in req.emails
@@ -1423,10 +1304,15 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         raise HTTPException(400, "Proxy URL is too long")
 
     results: dict[str, dict] = {}
+    plus_results: dict[str, dict] = {}
     summary = {"eligible": 0, "ineligible": 0}
     for email in emails:
         credential = db.get_registered(email)
         if not credential:
+            plus_results[email] = plus_probe_error(
+                "account_not_found", retryable=False,
+                status="not_found", label="Not found",
+            )
             result = gcash_probe_error(
                 "account_not_found", retryable=False,
                 status="not_found", label="Not found",
@@ -1436,11 +1322,17 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
             continue
         access_token = str(credential.get("access_token") or "").strip()
         if not access_token:
+            plus_info = plus_probe_error(
+                "missing_access_token", retryable=False,
+                status="no_at", label="No access token",
+            )
+            plus_results[email] = plus_info
             result = gcash_probe_error(
                 "missing_access_token", retryable=False,
                 status="no_at", label="No access token",
             )
             results[email] = result
+            db.update_eligibility_check(email, "plus_check", plus_info)
             db.update_eligibility_check(email, "gcash_check", result)
             summary["ineligible"] += 1
             continue
@@ -1449,30 +1341,49 @@ def api_check_gcash(req: CheckGCashReq, request: Request):
         account_id = str(
             claims.get("chatgpt_account_id") or claims.get("account_id") or ""
         ).strip()
-        device_id = str(credential.get("device_id") or "").strip() or str(
-            uuid.uuid5(uuid.NAMESPACE_DNS, f"gpt-auto-register-gcash:{email}")
-        )
+        device_id = _gcash_device_id(credential, email)
         try:
-            result = normalize_gcash_result(probe_gcash(
+            workflow = probe_gcash(
                 access_token=access_token,
                 account_id=account_id,
                 device_id=device_id,
                 cookie_header=str(credential.get("cookie_header") or ""),
                 proxy=proxy,
                 checkout_email=email,
-            ))
+            )
+            if isinstance(workflow, dict) and isinstance(workflow.get("gcash"), dict):
+                plus_info = workflow.get("plus") or {}
+                raw_result = workflow.get("gcash") or {}
+            else:
+                # Compatibility for callers that still inject a GCash-only
+                # probe. Production always returns the combined envelope.
+                plus_info = {}
+                raw_result = workflow
+            plus_results[email] = dict(plus_info)
+            result = normalize_gcash_result(raw_result)
         except Exception:
             logger.warning("[gcash_check] unexpected probe failure for %s", email)
+            plus_results[email] = plus_probe_error(
+                "probe_unexpected_error", retryable=True, status="error",
+            )
             result = gcash_probe_error(
                 "probe_unexpected_error", retryable=True,
                 status="error",
             )
         results[email] = result
+        plus_info = plus_results.get(email)
+        if isinstance(plus_info, dict) and should_persist_plus_result(plus_info):
+            db.update_eligibility_check(email, "plus_check", plus_info)
         db.update_eligibility_check(email, "gcash_check", result)
         classification = str(result.get("classification") or "ineligible")
         summary["eligible" if classification == "eligible" else "ineligible"] += 1
 
-    return {"ok": True, "results": results, "summary": summary}
+    return {
+        "ok": True,
+        "results": results,
+        "plus_results": plus_results,
+        "summary": summary,
+    }
 
 
 # ──────────────────────── auto-loop ────────────────────────

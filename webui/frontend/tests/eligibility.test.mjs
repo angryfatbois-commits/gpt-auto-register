@@ -98,18 +98,62 @@ test('availability detail exposes only sanitized capability diagnostics', () => 
   assert.doesNotMatch(unsafe, /Bearer|secret-token/i)
 })
 
+test('availability detail shows exact due and zero-payment status', () => {
+  const zero = formatGCashDetail({
+    classification: 'eligible',
+    decision: 'gcash_available',
+    amount_minor: 0,
+    currency: 'PHP',
+    checkout_country: 'PH',
+    zero_payment: true,
+    amount_status: 'zero',
+  })
+  const paid = formatGCashDetail({
+    classification: 'eligible',
+    decision: 'gcash_available',
+    amount_minor: 98214,
+    currency: 'PHP',
+    checkout_country: 'PH',
+    zero_payment: false,
+    amount_status: 'positive',
+  })
+
+  assert.match(zero, /Due: PHP 0/)
+  assert.match(zero, /Zero payment: Yes/)
+  assert.match(paid, /Due: PHP 98214/)
+  assert.match(paid, /Zero payment: No/)
+})
+
+test('availability detail exposes only a sanitized auth refresh status', () => {
+  const text = formatGCashDetail({
+    classification: 'ineligible',
+    decision: 'checkout_http_400',
+    auth_refresh_status: 'refreshed',
+  })
+
+  assert.match(text, /Session: refreshed/)
+
+  const unsafe = formatGCashDetail({
+    classification: 'ineligible',
+    decision: 'checkout_http_400',
+    auth_refresh_status: 'access-token-secret',
+  })
+  assert.doesNotMatch(unsafe, /access-token-secret/i)
+})
+
 test('legacy stored labels are presented as availability labels', () => {
   assert.equal(gcashDisplayLabel({ label: 'GCash eligible' }), 'GCash available')
   assert.equal(gcashDisplayLabel({ label: 'GCash ineligible' }), 'GCash unavailable')
   assert.equal(gcashDisplayLabel({ label: 'GCash status unknown' }), 'GCash unavailable')
 })
 
-test('GCash confirmation explains the source-compatible PH workflow', async () => {
+test('GCash confirmation explains the HAR-backed read-only workflow', async () => {
   const view = await readFile(new URL('../src/views/Registered.vue', import.meta.url), 'utf8')
 
   assert.match(view, /PH\/PHP checkout/)
   assert.match(view, /applies the Plus campaign/)
-  assert.match(view, /synchronizes taxes/)
-  assert.match(view, /Philippines proxy is required/)
-  assert.doesNotMatch(view, /selected proxy\/IP country/)
+  assert.match(view, /same selected proxy/)
+  assert.match(view, /does not require a Philippines proxy/i)
+  assert.doesNotMatch(view, /synchronizes taxes/)
+  assert.doesNotMatch(view, /Philippines proxy is required/)
 })

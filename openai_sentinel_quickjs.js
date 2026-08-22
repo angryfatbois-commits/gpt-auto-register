@@ -7,6 +7,10 @@ const cryptoMod = require('node:crypto');
 const input = JSON.parse(fs.readFileSync(0, 'utf8'));
 const sdkRaw = fs.readFileSync(process.env.OPENAI_SENTINEL_SDK_FILE, 'utf8');
 
+const sentinelScriptUrl = String(input.sentinel_script_url || 'https://sentinel.openai.com/sentinel/sdk.js');
+let sentinelOrigin = 'https://sentinel.openai.com';
+try { sentinelOrigin = new URL(sentinelScriptUrl).origin; } catch (_) {}
+
 const EXPOSE_PATCH = "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t}({});";
 const EXPOSE_REPLACEMENT =
   "return o?r?.[n(63)]?ce({so:o,c:r[n(63)]},t):o:null},t.token=ye,t.__debug_n=_n,t.__debug_bindProof=D,t}({});";
@@ -381,6 +385,12 @@ const context = {
       this.port2 = { postMessage() {}, addEventListener() {}, removeEventListener() {}, start() {}, close() {} };
     }
   },
+  AbortController,
+  PerformanceObserver: class PerformanceObserver {
+    constructor() {}
+    observe() {}
+    disconnect() {}
+  },
 
   chrome: { runtime: {}, app: {} },
   CSS: { supports() { return true; } },
@@ -396,14 +406,14 @@ const context = {
   removeEventListener: removeListener,
   dispatchEvent: (event) => { dispatch(event.type, event); return true; },
 
-  origin: 'https://auth.openai.com',
+  origin: sentinelOrigin,
 
   location: {
-    href: 'https://auth.openai.com/',
-    origin: 'https://auth.openai.com',
+    href: sentinelOrigin + '/',
+    origin: sentinelOrigin,
     protocol: 'https:',
-    host: 'auth.openai.com',
-    hostname: 'auth.openai.com',
+    host: new URL(sentinelOrigin).host,
+    hostname: new URL(sentinelOrigin).hostname,
     pathname: '/',
     search: '',
     hash: '',
@@ -416,12 +426,12 @@ const context = {
     readyState: 'complete',
     hidden: false,
     visibilityState: 'visible',
-    referrer: 'https://auth.openai.com/',
-    URL: 'https://auth.openai.com/',
-    documentURI: 'https://auth.openai.com/',
+    referrer: sentinelOrigin + '/',
+    URL: sentinelOrigin + '/',
+    documentURI: sentinelOrigin + '/',
     location: {
-      href: 'https://auth.openai.com/',
-      origin: 'https://auth.openai.com',
+      href: sentinelOrigin + '/',
+      origin: sentinelOrigin,
       pathname: '/',
       search: '',
     },
@@ -431,7 +441,7 @@ const context = {
     contentType: 'text/html',
     scripts,
     currentScript: {
-      src: 'https://sentinel.openai.com/sentinel/sdk.js',
+      src: sentinelScriptUrl,
       getAttribute() { return null; },
     },
     documentElement,
@@ -562,7 +572,11 @@ async function dispatchBehavior(durationMs) {
         process.stdout.write(JSON.stringify({ request_p: capturedProof }));
         return;
       }
-    } catch (_) {}
+    } catch (error) {
+      if (process.env.SENTINEL_DEBUG === '1') {
+        process.stderr.write(`requirements sdk error: ${String(error && error.message || error).slice(0, 240)}\n`);
+      }
+    }
     const requestP = await context.__debugP.getRequirementsToken();
     process.stdout.write(JSON.stringify({ request_p: requestP }));
     return;
@@ -590,7 +604,11 @@ async function dispatchBehavior(durationMs) {
         process.stdout.write(JSON.stringify({ token: mainToken, so_token: soToken || '' }));
         return;
       }
-    } catch (_) {}
+    } catch (error) {
+      if (process.env.SENTINEL_DEBUG === '1') {
+        process.stderr.write(`token sdk error: ${String(error && error.message || error).slice(0, 240)}\n`);
+      }
+    }
 
     const challenge = input.challenge || {};
     const requestP = String(input.request_p || '').trim();

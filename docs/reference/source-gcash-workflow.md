@@ -1,75 +1,101 @@
 # GCash workflow provenance and implementation boundary
 
-This note records the protocol facts inspected in
-`2951461586/GPT-Register-Tool` at commit
-`593e994de16255d0fa0529ea1222ec1d6f8f4f81` (2026-08-19). The repository has no
-root `LICENSE` file. The target therefore uses a clean-room implementation:
-the endpoint order and request concepts were recorded, but source code,
-comments, fixtures, fake identities, and opaque payment identifiers were not
-copied.
+This note records the protocol facts verified from the supplied browser HAR and
+the clean-room implementation boundary. The raw HAR remains outside the
+repository and is never used as a fixture.
 
-## Observed source sequence
+## Verified browser sequence
 
-The source GCash adapter's capability-only branch performs these stages on one
-checkout session:
+The relevant authenticated requests were:
 
-1. Create a custom ChatGPT Plus checkout and ask Checkout to perform its proxy
-   card check.
-2. Update the session with the monthly Plus plan and the
-   `plus-1-month-free` campaign.
-3. Submit a best-effort tax synchronization for the same session.
-4. Resolve the session to obtain the current payment-method set.
-5. Query Stripe custom-payment capability metadata using a customer-session
-   secret and the custom-method type supplied by the checkout/configuration.
-6. Return a capability result without calling the source adapter's confirm or
-   custom-payment-start stages when probe-only mode is selected.
+```text
+GET  /backend-api/accounts/check/v4-2023-04-27
+POST /backend-api/payments/checkout
+GET  https://api.stripe.com/v1/elements/sessions
+```
 
-The source's non-probe branch continues from capability to custom-method
-confirmation and provider redirect. That branch is intentionally not imported
-into this application.
+No checkout update, tax, resolve, Payment Pages, confirmation, redirect,
+subscribe, payment-intent, or custom-payment-start request appeared in the
+verified capability flow.
+
+The browser also performs a transport preflight around the Checkout request:
+
+```text
+GET  https://chatgpt.com/                           (best-effort bootstrap)
+GET  https://chatgpt.com/sentinel/<current>/sdk.js (when advertised)
+POST https://chatgpt.com/backend-api/sentinel/req  (flow=chatgpt_checkout)
+POST https://chatgpt.com/backend-api/sentinel/ping (best-effort heartbeat)
+```
+
+These calls prepare short-lived browser metadata; they are not additional
+eligibility stages. The implementation discovers the current Sentinel SDK URL
+from the live same-origin response, validates its origin and path, and creates
+a fresh token for each probe. It never copies a token, telemetry sample, or
+deployment attestation from the HAR. An attestation is used only when the
+current response (or a validated operator environment value) supplies one;
+signatures are not fabricated or persisted.
+
+The checkout request contains:
+
+```json
+{
+  "entry_point": "all_plans_pricing_modal",
+  "plan_name": "chatgptplusplan",
+  "billing_details": {"country": "PH", "currency": "PHP"},
+  "checkout_ui_mode": "custom",
+  "promo_campaign": {
+    "promo_campaign_id": "plus-1-month-free",
+    "is_coupon_from_query_param": false
+  }
+}
+```
+
+The body does not contain `check_card_proxy`. Checkout due is read only from
+`checkout_state.total.total.minorUnitsAmount`. Stripe receives the exact opaque
+custom-method ID and returns a matching method whose safe display name is
+`GCash`. Stripe's preference country may be VN and does not invalidate a
+PH/PHP checkout.
 
 ## Target implementation
 
-`gcash_probe.py` now implements the safe subset with this order:
+`gcash_probe.py` uses one ChatGPT session for accounts/check and checkout, then
+an isolated Stripe session. Both sessions use the selected proxy, the same
+Chrome impersonation and User-Agent, and no direct or alternate-fingerprint
+fallback. The supported automated TLS profile is Chrome 146 because that is
+the newest Chrome profile available in the installed `curl_cffi`; the supplied
+HAR was captured by Chrome/Brave 151, so the implementation does not claim
+byte-for-byte browser fidelity. A transient or strict-HAR contract rejection
+may retry once with the identical payload and identity; HTTP 400/422 is only
+eligible for this retry on the first strict Checkout attempt.
 
-```text
-POST /backend-api/payments/checkout
-POST /backend-api/payments/checkout/update
-POST /backend-api/payments/checkout/taxes
-GET  /backend-api/payments/checkout/{processor}/{checkout_session}
-POST /v1/payment_pages/{checkout_session}/init   (standard methods)
-GET  /v1/elements/sessions                      (custom method metadata)
-```
+If the stored account record contains a NextAuth session cookie, an optional
+same-origin `/api/auth/session` preflight refreshes the access token before
+the three HAR stages. It is not part of the capability decision; refreshed
+credentials are accepted only after account-claim correlation and remain in
+memory for the current probe.
 
-The Checkout request is explicitly `PH`/`PHP`, carries the exact campaign ID,
-and sets `check_card_proxy=true`. Every later ChatGPT request is bound to the
-session ID and processor returned by the first response. The tax stage only
-uses the observed region and the account email supplied by the local API; it
-does not invent a billing address or submit payment credentials. Update/tax
-failures are retained as technical diagnostics and do not erase affirmative
-method evidence.
+The combined result contains independent Plus and GCash verdicts. Plus records
+the exact campaign, 100% discount, and one-month duration. GCash is available
+only after:
 
-`GCASH_CUSTOM_PAYMENT_METHOD_ID` is an optional deployment setting for an
-opaque custom-method ID that the operator has independently verified. The
-application does not embed the source repository's opaque identifier.
+1. PH/PHP billing evidence is present;
+2. the exact checkout total is structurally readable;
+3. the checkout custom ID makes an exact Stripe round trip; and
+4. Stripe explicitly names the matching method `GCash`.
 
-## Classification boundary
+Zero due and positive due both keep GCash available; the result separately
+reports `amount_minor`, `amount_status`, and `zero_payment`. Malformed due is
+incomplete evidence, is never converted to zero, and fails closed.
 
-The user-facing result remains binary:
+The WebUI retains its explicit checkout acknowledgement and loopback/admin
+token gate. The bootstrap request may carry the selected account's access
+token, account header, and sanitized cookie in memory so the current page can
+return current metadata; these values are never returned by the probe. No
+credential, cookie, proxy secret, customer secret, checkout ID, opaque method
+ID, Sentinel token, attestation, or raw response is returned or persisted.
 
-- explicit GCash evidence: `GCash available`;
-- a `cpmt_...` candidate returned by Checkout and echoed by Stripe Elements for
-  the same PH/PHP session: `GCash available`, even when the display label is
-  localized or merchant-defined;
-- explicit method evidence without GCash, missing evidence, authentication
-  failure, or transport failure: `GCash unavailable`.
+## Source boundary
 
-Amount is retained for diagnostics and does not override method availability.
-The probe requires the explicit PH/PHP contract for opaque custom-method
-matching. Technical `decision`, `status`, `retryable`, and redacted custom
-capability stage codes remain available for troubleshooting.
-
-The probe never calls checkout confirmation, custom-payment start, provider
-redirect, or any payment execution endpoint. The WebUI's existing explicit
-side-effect acknowledgement remains mandatory because creating/updating an
-ephemeral checkout is still a remote side effect.
+The reference repository was used only to compare high-level protocol concepts.
+No source code, comments, identities, opaque IDs, credentials, or raw response
+body was copied. Payment execution remains outside this application's scope.
