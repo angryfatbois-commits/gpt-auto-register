@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import json
+import tempfile
 import time
 import unittest
 from unittest.mock import patch
@@ -20,7 +21,7 @@ from chatgpt_checkout_transport import (
     prepare_checkout_transport,
 )
 from gcash_probe import probe_checkout_eligibility
-from sentinel_quickjs import _fetch_sentinel_challenge
+from sentinel_quickjs import _ensure_sdk_file, _fetch_sentinel_challenge
 
 
 METHOD_ID = "cpmt_synthetic_gcash"
@@ -164,6 +165,25 @@ def _stripe():
 
 
 class CheckoutHeaderIntegrationTests(unittest.TestCase):
+    def test_sentinel_sdk_download_disables_redirects_before_execution(self):
+        response = _Response({})
+        response.content = b"synthetic-sdk"
+        session = _Session([response])
+        with tempfile.TemporaryDirectory() as cache_root, patch(
+            "sentinel_quickjs.tempfile.gettempdir",
+            return_value=cache_root,
+        ), patch("sentinel_quickjs._sdk_file_cache", {}):
+            sdk_file, sdk_url = _ensure_sdk_file(
+                session,
+                30_000,
+                sdk_url="https://chatgpt.com/sentinel/synthetic-v1/sdk.js",
+            )
+            sdk_contents = sdk_file.read_bytes()
+
+        self.assertEqual(sdk_url, "https://chatgpt.com/sentinel/synthetic-v1/sdk.js")
+        self.assertEqual(sdk_contents, b"synthetic-sdk")
+        self.assertFalse(session.calls[0][2]["allow_redirects"])
+
     def test_legacy_sentinel_challenge_keeps_the_session_post_path(self):
         session = _Session([_Response({"token": "legacy-challenge"})])
 
@@ -179,6 +199,7 @@ class CheckoutHeaderIntegrationTests(unittest.TestCase):
         self.assertEqual(len(session.isolated_calls), 0)
         self.assertEqual(session.calls[0][0], "POST")
         self.assertIn("sentinel.openai.com/backend-api/sentinel/req", session.calls[0][1])
+        self.assertFalse(session.calls[0][2]["allow_redirects"])
 
     def test_checkout_sentinel_challenge_uses_isolated_post_and_client_hints(self):
         session = _Session([_Response({"token": "checkout-challenge"})])
@@ -205,6 +226,7 @@ class CheckoutHeaderIntegrationTests(unittest.TestCase):
         self.assertEqual(result["token"], "checkout-challenge")
         self.assertEqual(len(session.isolated_calls), 1)
         headers = session.isolated_calls[0][2]["headers"]
+        self.assertFalse(session.isolated_calls[0][2]["allow_redirects"])
         self.assertEqual(headers["sec-ch-ua"], '"Chromium";v="146"')
         self.assertEqual(headers["sec-ch-ua-mobile"], "?0")
         self.assertEqual(headers["sec-ch-ua-platform"], '"Windows"')
@@ -273,6 +295,37 @@ class CheckoutHeaderIntegrationTests(unittest.TestCase):
             sentinel.call_args.kwargs["sentinel_req_url"],
             "https://chatgpt.com/backend-api/sentinel/req",
         )
+
+    def test_missing_attestation_keeps_strict_sentinel_checkout_fallback(self):
+        html = (
+            '<html data-build="prod-synthetic-build" data-seq="12345">'
+            '<script src="https://chatgpt.com/sentinel/synthetic-v1/sdk.js"></script>'
+            '</html>'
+        )
+        session = _Session([
+            _Response({}, text=html, headers={"content-type": "text/html"}),
+            _Response({"status": "ok"}),
+        ])
+
+        with patch(
+            "sentinel.get_sentinel_token",
+            return_value=("fresh-sentinel-token", ""),
+        ):
+            metadata = prepare_checkout_transport(
+                session=session,
+                access_token="access-token",
+                account_id="account-stable",
+                device_id="11111111-2222-4333-8444-555555555555",
+                cookie_header="safe=value",
+                session_id="aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee",
+                timeout=30,
+                user_agent="Synthetic Chrome/146",
+                sec_ch_ua='"Chromium";v="146"',
+                sec_ch_ua_full_version_list='"Chromium";v="146.0.0.0"',
+            )
+
+        self.assertEqual(metadata.attestation, "")
+        self.assertTrue(metadata.strict_har)
 
     def test_injected_dynamic_metadata_is_attached_only_to_checkout(self):
         chatgpt = _Session([_Response(_accounts()), _Response(_checkout())])
